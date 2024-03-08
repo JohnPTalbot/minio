@@ -36,6 +36,7 @@ const (
 	ObjectAccessedGetRetention
 	ObjectAccessedGetLegalHold
 	ObjectAccessedHead
+	ObjectAccessedAttributes
 	ObjectCreatedCompleteMultipartUpload
 	ObjectCreatedCopy
 	ObjectCreatedPost
@@ -46,6 +47,7 @@ const (
 	ObjectCreatedDeleteTagging
 	ObjectRemovedDelete
 	ObjectRemovedDeleteMarkerCreated
+	ObjectRemovedNoOP
 	BucketCreated
 	BucketRemoved
 	ObjectReplicationFailed
@@ -84,7 +86,7 @@ func (name Name) Expand() []Name {
 	case ObjectAccessedAll:
 		return []Name{
 			ObjectAccessedGet, ObjectAccessedHead,
-			ObjectAccessedGetRetention, ObjectAccessedGetLegalHold,
+			ObjectAccessedGetRetention, ObjectAccessedGetLegalHold, ObjectAccessedAttributes,
 		}
 	case ObjectCreatedAll:
 		return []Name{
@@ -97,6 +99,7 @@ func (name Name) Expand() []Name {
 		return []Name{
 			ObjectRemovedDelete,
 			ObjectRemovedDeleteMarkerCreated,
+			ObjectRemovedNoOP,
 		}
 	case ObjectReplicationAll:
 		return []Name{
@@ -162,6 +165,8 @@ func (name Name) String() string {
 		return "s3:ObjectAccessed:GetLegalHold"
 	case ObjectAccessedHead:
 		return "s3:ObjectAccessed:Head"
+	case ObjectAccessedAttributes:
+		return "s3:ObjectAccessed:Attributes"
 	case ObjectCreatedAll:
 		return "s3:ObjectCreated:*"
 	case ObjectCreatedCompleteMultipartUpload:
@@ -186,6 +191,8 @@ func (name Name) String() string {
 		return "s3:ObjectRemoved:Delete"
 	case ObjectRemovedDeleteMarkerCreated:
 		return "s3:ObjectRemoved:DeleteMarkerCreated"
+	case ObjectRemovedNoOP:
+		return "s3:ObjectRemoved:NoOP"
 	case ObjectReplicationAll:
 		return "s3:Replication:*"
 	case ObjectReplicationFailed:
@@ -278,6 +285,8 @@ func ParseName(s string) (Name, error) {
 		return ObjectAccessedGetLegalHold, nil
 	case "s3:ObjectAccessed:Head":
 		return ObjectAccessedHead, nil
+	case "s3:ObjectAccessed:Attributes":
+		return ObjectAccessedAttributes, nil
 	case "s3:ObjectCreated:*":
 		return ObjectCreatedAll, nil
 	case "s3:ObjectCreated:CompleteMultipartUpload":
@@ -302,6 +311,8 @@ func ParseName(s string) (Name, error) {
 		return ObjectRemovedDelete, nil
 	case "s3:ObjectRemoved:DeleteMarkerCreated":
 		return ObjectRemovedDeleteMarkerCreated, nil
+	case "s3:ObjectRemoved:NoOP":
+		return ObjectRemovedNoOP, nil
 	case "s3:Replication:*":
 		return ObjectReplicationAll, nil
 	case "s3:Replication:OperationFailedReplication":

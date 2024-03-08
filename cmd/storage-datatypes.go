@@ -19,17 +19,34 @@ package cmd
 
 import (
 	"time"
+
+	"github.com/minio/minio/internal/crypto"
 )
 
+//go:generate msgp -file=$GOFILE
+
 // DeleteOptions represents the disk level delete options available for the APIs
-//
-//msgp:ignore DeleteOptions
 type DeleteOptions struct {
-	Recursive bool
-	Force     bool
+	BaseOptions
+	Recursive bool `msg:"r"`
+	Immediate bool `msg:"i"`
+	UndoWrite bool `msg:"u"`
 }
 
-//go:generate msgp -file=$GOFILE
+// BaseOptions represents common options for all Storage API calls
+type BaseOptions struct{}
+
+// RenameOptions represents rename API options, currently its same as BaseOptions
+type RenameOptions struct {
+	BaseOptions
+}
+
+// DiskInfoOptions options for requesting custom results.
+type DiskInfoOptions struct {
+	DiskID  string `msg:"id"`
+	Metrics bool   `msg:"m"`
+	NoOp    bool   `msg:"np"`
+}
 
 // DiskInfo is an extended type which returns current
 // disk usage per path.
@@ -65,8 +82,11 @@ type DiskInfo struct {
 type DiskMetrics struct {
 	LastMinute              map[string]AccElem `json:"apiLatencies,omitempty"`
 	APICalls                map[string]uint64  `json:"apiCalls,omitempty"`
+	TotalWaiting            uint32             `json:"totalWaiting,omitempty"`
 	TotalErrorsAvailability uint64             `json:"totalErrsAvailability"`
 	TotalErrorsTimeout      uint64             `json:"totalErrsTimeout"`
+	TotalWrites             uint64             `json:"totalWrites"`
+	TotalDeletes            uint64             `json:"totalDeletes"`
 }
 
 // VolsInfo is a collection of volume(bucket) information
@@ -143,12 +163,7 @@ func (f *FileInfoVersions) findVersionIndex(v string) int {
 // Make sure to bump the internode version at storage-rest-common.go
 type RawFileInfo struct {
 	// Content of entire xl.meta (may contain data depending on what was requested by the caller.
-	Buf []byte `msg:"b"`
-
-	// DiskMTime indicates the mtime of the xl.meta on disk
-	// This is mainly used for detecting a particular issue
-	// reported in https://github.com/minio/minio/pull/13803
-	DiskMTime time.Time `msg:"dmt"`
+	Buf []byte `msg:"b,allownil"`
 }
 
 // FileInfo - represents file stat information.
@@ -229,16 +244,21 @@ type FileInfo struct {
 	// usage in other calls in undefined please avoid.
 	Idx int `msg:"i"`
 
-	// DiskMTime indicates the mtime of the xl.meta on disk
-	// This is mainly used for detecting a particular issue
-	// reported in https://github.com/minio/minio/pull/13803
-	DiskMTime time.Time `msg:"dmt"`
-
 	// Combined checksum when object was uploaded.
 	Checksum []byte `msg:"cs,allownil"`
 
 	// Versioned - indicates if this file is versioned or not.
 	Versioned bool `msg:"vs"`
+}
+
+// ShallowCopy - copies minimal information for READ MRF checks.
+func (fi FileInfo) ShallowCopy() (n FileInfo) {
+	n.Volume = fi.Volume
+	n.Name = fi.Name
+	n.VersionID = fi.VersionID
+	n.Deleted = fi.Deleted
+	n.Erasure = fi.Erasure
+	return
 }
 
 // WriteQuorum returns expected write quorum for this FileInfo
@@ -263,10 +283,15 @@ func (fi FileInfo) ReadQuorum(dquorum int) int {
 
 // Equals checks if fi(FileInfo) matches ofi(FileInfo)
 func (fi FileInfo) Equals(ofi FileInfo) (ok bool) {
-	if !fi.MetadataEquals(ofi) {
+	typ1, ok1 := crypto.IsEncrypted(fi.Metadata)
+	typ2, ok2 := crypto.IsEncrypted(ofi.Metadata)
+	if ok1 != ok2 {
 		return false
 	}
-	if !fi.ReplicationInfoEquals(ofi) {
+	if typ1 != typ2 {
+		return false
+	}
+	if fi.IsCompressed() != ofi.IsCompressed() {
 		return false
 	}
 	if !fi.TransitionInfoEquals(ofi) {
@@ -291,6 +316,12 @@ func (fi FileInfo) GetDataDir() string {
 		return "legacy"
 	}
 	return fi.DataDir
+}
+
+// IsCompressed returns true if the object is marked as compressed.
+func (fi FileInfo) IsCompressed() bool {
+	_, ok := fi.Metadata[ReservedMetadataPrefix+"compression"]
+	return ok
 }
 
 // InlineData returns true if object contents are inlined alongside its metadata.
@@ -348,4 +379,95 @@ type ReadMultipleResp struct {
 	Error   string    // Returns any error when reading.
 	Data    []byte    // Contains all data of file.
 	Modtime time.Time // Modtime of file on disk.
+}
+
+// DeleteVersionHandlerParams are parameters for DeleteVersionHandler
+type DeleteVersionHandlerParams struct {
+	DiskID         string        `msg:"id"`
+	Volume         string        `msg:"v"`
+	FilePath       string        `msg:"fp"`
+	ForceDelMarker bool          `msg:"fdm"`
+	Opts           DeleteOptions `msg:"do"`
+	FI             FileInfo      `msg:"fi"`
+}
+
+// MetadataHandlerParams is request info for UpdateMetadataHandle and WriteMetadataHandler.
+type MetadataHandlerParams struct {
+	DiskID     string             `msg:"id"`
+	Volume     string             `msg:"v"`
+	OrigVolume string             `msg:"ov"`
+	FilePath   string             `msg:"fp"`
+	UpdateOpts UpdateMetadataOpts `msg:"uo"`
+	FI         FileInfo           `msg:"fi"`
+}
+
+// UpdateMetadataOpts provides an optional input to indicate if xl.meta updates need to be fully synced to disk.
+type UpdateMetadataOpts struct {
+	NoPersistence bool `msg:"np"`
+}
+
+// CheckPartsHandlerParams are parameters for CheckPartsHandler
+type CheckPartsHandlerParams struct {
+	DiskID   string   `msg:"id"`
+	Volume   string   `msg:"v"`
+	FilePath string   `msg:"fp"`
+	FI       FileInfo `msg:"fi"`
+}
+
+// DeleteFileHandlerParams are parameters for DeleteFileHandler
+type DeleteFileHandlerParams struct {
+	DiskID   string        `msg:"id"`
+	Volume   string        `msg:"v"`
+	FilePath string        `msg:"fp"`
+	Opts     DeleteOptions `msg:"do"`
+}
+
+// RenameDataHandlerParams are parameters for RenameDataHandler.
+type RenameDataHandlerParams struct {
+	DiskID    string        `msg:"id"`
+	SrcVolume string        `msg:"sv"`
+	SrcPath   string        `msg:"sp"`
+	DstVolume string        `msg:"dv"`
+	DstPath   string        `msg:"dp"`
+	FI        FileInfo      `msg:"fi"`
+	Opts      RenameOptions `msg:"ro"`
+}
+
+// RenameFileHandlerParams are parameters for RenameFileHandler.
+type RenameFileHandlerParams struct {
+	DiskID      string `msg:"id"`
+	SrcVolume   string `msg:"sv"`
+	SrcFilePath string `msg:"sp"`
+	DstVolume   string `msg:"dv"`
+	DstFilePath string `msg:"dp"`
+}
+
+// ReadAllHandlerParams are parameters for ReadAllHandler.
+type ReadAllHandlerParams struct {
+	DiskID   string `msg:"id"`
+	Volume   string `msg:"v"`
+	FilePath string `msg:"fp"`
+}
+
+// WriteAllHandlerParams are parameters for WriteAllHandler.
+type WriteAllHandlerParams struct {
+	DiskID   string `msg:"id"`
+	Volume   string `msg:"v"`
+	FilePath string `msg:"fp"`
+	Buf      []byte `msg:"b"`
+}
+
+// RenameDataResp - RenameData()'s response.
+type RenameDataResp struct {
+	Signature uint64 `msg:"sig"`
+}
+
+// LocalDiskIDs - GetLocalIDs response.
+type LocalDiskIDs struct {
+	IDs []string
+}
+
+// ListDirResult - ListDir()'s response.
+type ListDirResult struct {
+	Entries []string `msg:"e"`
 }

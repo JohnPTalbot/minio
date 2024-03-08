@@ -91,7 +91,7 @@ func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m ma
 		}
 		cm, err := c.Times(false)
 		if err != nil {
-			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v  (cputimes)", globalMinioAddr, err.Error()))
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v (cpuTimes)", globalMinioAddr, err.Error()))
 		} else {
 			// not collecting per-cpu stats, so there will be only one element
 			if len(cm) == 1 {
@@ -100,6 +100,13 @@ func collectLocalMetrics(types madmin.MetricType, opts collectMetricsOpts) (m ma
 				m.Errors = append(m.Errors, fmt.Sprintf("%s: Expected one CPU stat, got %d", globalMinioAddr, len(cm)))
 			}
 		}
+		cpuCount, err := c.Counts(true)
+		if err != nil {
+			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v (cpuCount)", globalMinioAddr, err.Error()))
+		} else {
+			m.Aggregated.CPU.CPUCount = cpuCount
+		}
+
 		loadStat, err := load.Avg()
 		if err != nil {
 			m.Errors = append(m.Errors, fmt.Sprintf("%s: %v (loadStat)", globalMinioAddr, err.Error()))
@@ -123,13 +130,7 @@ func collectLocalDisksMetrics(disks map[string]struct{}) map[string]madmin.DiskM
 	}
 
 	metrics := make(map[string]madmin.DiskMetric)
-
-	procStats, procErr := disk.GetAllDrivesIOStats()
-	if procErr != nil {
-		return metrics
-	}
-
-	storageInfo := objLayer.LocalStorageInfo(GlobalContext)
+	storageInfo := objLayer.LocalStorageInfo(GlobalContext, true)
 	for _, d := range storageInfo.Disks {
 		if len(disks) != 0 {
 			_, ok := disks[d.Endpoint]
@@ -163,9 +164,8 @@ func collectLocalDisksMetrics(disks map[string]struct{}) map[string]madmin.DiskM
 			}
 		}
 
-		// get disk
-		if procErr == nil {
-			st := procStats[disk.DevID{Major: d.Major, Minor: d.Minor}]
+		st, err := disk.GetDriveStats(d.Major, d.Minor)
+		if err == nil {
 			dm.IOStats = madmin.DiskIOStats{
 				ReadIOs:        st.ReadIOs,
 				ReadMerges:     st.ReadMerges,

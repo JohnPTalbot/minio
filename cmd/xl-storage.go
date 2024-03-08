@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -42,10 +43,12 @@ import (
 	"github.com/klauspost/filepathx"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/cachevalue"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/disk"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
+	"github.com/pkg/xattr"
 	"github.com/zeebo/xxh3"
 )
 
@@ -91,31 +94,31 @@ func isValidVolname(volname string) bool {
 
 // xlStorage - implements StorageAPI interface.
 type xlStorage struct {
+	// Indicate of NSScanner is in progress in this disk
+	scanning int32
+
 	drivePath string
 	endpoint  Endpoint
 
 	globalSync bool
 	oDirect    bool // indicates if this disk supports ODirect
-	rootDisk   bool
 
 	diskID string
 
 	// Indexes, will be -1 until assigned a set.
 	poolIndex, setIndex, diskIndex int
 
-	// Indicate of NSScanner is in progress in this disk
-	scanning int32
-
 	formatFileInfo  os.FileInfo
+	formatFile      string
 	formatLegacy    bool
 	formatLastCheck time.Time
 
-	diskInfoCache timedValue
+	diskInfoCache *cachevalue.Cache[DiskInfo]
 	sync.RWMutex
-
 	formatData []byte
 
-	nrRequests uint64
+	nrRequests   uint64
+	major, minor uint32
 
 	// mutex to prevent concurrent read operations overloading walks.
 	rotational bool
@@ -192,15 +195,6 @@ func getValidPath(path string) (string, error) {
 	return path, nil
 }
 
-// isDirEmpty - returns whether given directory is empty or not.
-func isDirEmpty(dirname string) bool {
-	entries, err := readDirN(dirname, 1)
-	if err != nil {
-		return false
-	}
-	return len(entries) == 0
-}
-
 // Initialize a new storage disk.
 func newLocalXLStorage(path string) (*xlStorage, error) {
 	u := url.URL{Path: path}
@@ -210,41 +204,62 @@ func newLocalXLStorage(path string) (*xlStorage, error) {
 	}, true)
 }
 
+// Make Erasure backend meta volumes.
+func makeFormatErasureMetaVolumes(disk StorageAPI) error {
+	if disk == nil {
+		return errDiskNotFound
+	}
+	volumes := []string{
+		minioMetaTmpDeletedBucket, // creates .minio.sys/tmp as well as .minio.sys/tmp/.trash
+		minioMetaMultipartBucket,  // creates .minio.sys/multipart
+		dataUsageBucket,           // creates .minio.sys/buckets
+		minioConfigBucket,         // creates .minio.sys/config
+	}
+	// Attempt to create MinIO internal buckets.
+	return disk.MakeVolBulk(context.TODO(), volumes...)
+}
+
 // Initialize a new storage disk.
 func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
-	path := ep.Path
-	if path, err = getValidPath(path); err != nil {
-		return nil, err
+	s = &xlStorage{
+		drivePath:     ep.Path,
+		endpoint:      ep,
+		globalSync:    globalFSOSync,
+		diskInfoCache: cachevalue.New[DiskInfo](),
+		poolIndex:     -1,
+		setIndex:      -1,
+		diskIndex:     -1,
 	}
 
-	info, err := disk.GetInfo(path, true)
+	s.drivePath, err = getValidPath(ep.Path)
 	if err != nil {
-		return nil, err
+		s.drivePath = ep.Path
+		return s, err
 	}
 
-	var rootDisk bool
+	info, err := disk.GetInfo(s.drivePath, true)
+	if err != nil {
+		return s, err
+	}
+	s.major = info.Major
+	s.minor = info.Minor
+
 	if !globalIsCICD && !globalIsErasureSD {
+		var rootDrive bool
 		if globalRootDiskThreshold > 0 {
 			// Use MINIO_ROOTDISK_THRESHOLD_SIZE to figure out if
 			// this disk is a root disk. treat those disks with
-			// size less than or equal to the threshold as rootDisks.
-			rootDisk = info.Total <= globalRootDiskThreshold
+			// size less than or equal to the threshold as rootDrives.
+			rootDrive = info.Total <= globalRootDiskThreshold
 		} else {
-			rootDisk, err = disk.IsRootDisk(path, SlashSeparator)
+			rootDrive, err = disk.IsRootDisk(s.drivePath, SlashSeparator)
 			if err != nil {
 				return nil, err
 			}
 		}
-	}
-
-	s = &xlStorage{
-		drivePath:  path,
-		endpoint:   ep,
-		globalSync: globalFSOSync,
-		rootDisk:   rootDisk,
-		poolIndex:  -1,
-		setIndex:   -1,
-		diskIndex:  -1,
+		if rootDrive {
+			return s, errDriveIsRoot
+		}
 	}
 
 	// Sanitize before setting it
@@ -266,21 +281,22 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
 	formatData, formatFi, err := formatErasureMigrate(s.drivePath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		if os.IsPermission(err) {
-			return nil, errDiskAccessDenied
+			return s, errDiskAccessDenied
 		} else if isSysErrIO(err) {
-			return nil, errFaultyDisk
+			return s, errFaultyDisk
 		}
-		return nil, err
+		return s, err
 	}
 	s.formatData = formatData
 	s.formatFileInfo = formatFi
+	s.formatFile = pathJoin(s.drivePath, minioMetaBucket, formatConfigFile)
 
-	if len(s.formatData) == 0 {
-		// Create all necessary bucket folders if possible.
-		if err = makeFormatErasureMetaVolumes(s); err != nil {
-			return nil, err
-		}
-	} else {
+	// Create all necessary bucket folders if possible.
+	if err = makeFormatErasureMetaVolumes(s); err != nil {
+		return s, err
+	}
+
+	if len(s.formatData) > 0 {
 		format := &formatErasureV3{}
 		json := jsoniter.ConfigCompatibleWithStandardLibrary
 		if err = json.Unmarshal(s.formatData, &format); err != nil {
@@ -353,13 +369,17 @@ func (s *xlStorage) IsLocal() bool {
 
 // Retrieve location indexes.
 func (s *xlStorage) GetDiskLoc() (poolIdx, setIdx, diskIdx int) {
-	s.RLock()
-	defer s.RUnlock()
 	// If unset, see if we can locate it.
 	if s.poolIndex < 0 || s.setIndex < 0 || s.diskIndex < 0 {
 		return getXLDiskLoc(s.diskID)
 	}
 	return s.poolIndex, s.setIndex, s.diskIndex
+}
+
+func (s *xlStorage) SetFormatData(b []byte) {
+	s.Lock()
+	defer s.Unlock()
+	s.formatData = b
 }
 
 // Set location indexes.
@@ -446,16 +466,13 @@ func (s *xlStorage) readMetadataWithDMTime(ctx context.Context, itemPath string)
 }
 
 func (s *xlStorage) readMetadata(ctx context.Context, itemPath string) ([]byte, error) {
-	var buf []byte
-	err := xioutil.NewDeadlineWorker(diskMaxTimeout).Run(func() error {
-		var rerr error
-		buf, _, rerr = s.readMetadataWithDMTime(ctx, itemPath)
-		return rerr
+	return xioutil.WithDeadline[[]byte](ctx, globalDriveConfig.GetMaxTimeout(), func(ctx context.Context) ([]byte, error) {
+		buf, _, err := s.readMetadataWithDMTime(ctx, itemPath)
+		return buf, err
 	})
-	return buf, err
 }
 
-func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode) (dataUsageCache, error) {
+func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode, weSleep func() bool) (dataUsageCache, error) {
 	atomic.AddInt32(&s.scanning, 1)
 	defer atomic.AddInt32(&s.scanning, -1)
 
@@ -470,7 +487,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 	}()
 
 	// Updates must be closed before we return.
-	defer close(updates)
+	defer xioutil.SafeClose(updates)
 	var lc *lifecycle.Lifecycle
 
 	// Check if the current bucket has a configured lifecycle policy
@@ -557,7 +574,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 		}
 
 		done := globalScannerMetrics.time(scannerMetricApplyAll)
-		objInfos, err := item.applyVersionActions(ctx, objAPI, fivs.Versions)
+		objInfos, err := item.applyVersionActions(ctx, objAPI, fivs.Versions, globalExpiryState)
 		done()
 
 		if err != nil {
@@ -567,11 +584,19 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 
 		versioned := vcfg != nil && vcfg.Versioned(item.objectPath())
 
+		var objDeleted bool
 		for _, oi := range objInfos {
 			done = globalScannerMetrics.time(scannerMetricApplyVersion)
-			sz := item.applyActions(ctx, objAPI, oi, &sizeS)
+			var sz int64
+			objDeleted, sz = item.applyActions(ctx, objAPI, oi, &sizeS)
 			done()
 
+			// DeleteAllVersionsAction: The object and all its
+			// versions are expired and
+			// doesn't contribute toward data usage.
+			if objDeleted {
+				break
+			}
 			actualSz, err := oi.GetActualSize()
 			if err != nil {
 				continue
@@ -609,7 +634,7 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 		for _, freeVersion := range fivs.FreeVersions {
 			oi := freeVersion.ToObjectInfo(item.bucket, item.objectPath(), versioned)
 			done = globalScannerMetrics.time(scannerMetricTierObjSweep)
-			item.applyTierObjSweep(ctx, objAPI, oi)
+			globalExpiryState.enqueueFreeVersion(oi)
 			done()
 		}
 
@@ -644,8 +669,14 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 				}
 			}
 		}
+		if objDeleted {
+			// we return errIgnoreFileContrib to signal this function's
+			// callers to skip this object's contribution towards
+			// usage.
+			return sizeSummary{}, errIgnoreFileContrib
+		}
 		return sizeS, nil
-	}, scanMode)
+	}, scanMode, weSleep)
 	if err != nil {
 		return dataUsageInfo, err
 	}
@@ -654,20 +685,49 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 	return dataUsageInfo, nil
 }
 
+func (s *xlStorage) getDeleteAttribute() uint64 {
+	attr := "user.total_deletes"
+	buf, err := xattr.LGet(s.formatFile, attr)
+	if err != nil {
+		// We start off with '0' if we can read the attributes
+		return 0
+	}
+	return binary.LittleEndian.Uint64(buf[:8])
+}
+
+func (s *xlStorage) getWriteAttribute() uint64 {
+	attr := "user.total_writes"
+	buf, err := xattr.LGet(s.formatFile, attr)
+	if err != nil {
+		// We start off with '0' if we can read the attributes
+		return 0
+	}
+
+	return binary.LittleEndian.Uint64(buf[:8])
+}
+
+func (s *xlStorage) setDeleteAttribute(deleteCount uint64) error {
+	attr := "user.total_deletes"
+
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, deleteCount)
+	return xattr.LSet(s.formatFile, attr, data)
+}
+
+func (s *xlStorage) setWriteAttribute(writeCount uint64) error {
+	attr := "user.total_writes"
+
+	data := make([]byte, 8)
+	binary.LittleEndian.PutUint64(data, writeCount)
+	return xattr.LSet(s.formatFile, attr, data)
+}
+
 // DiskInfo provides current information about disk space usage,
 // total free inodes and underlying filesystem.
-func (s *xlStorage) DiskInfo(_ context.Context, _ bool) (info DiskInfo, err error) {
-	// Do not cache results from atomic variables
-	scanning := atomic.LoadInt32(&s.scanning) == 1
-
-	s.diskInfoCache.Once.Do(func() {
-		s.diskInfoCache.TTL = time.Second
-		s.diskInfoCache.Update = func() (interface{}, error) {
-			dcinfo := DiskInfo{
-				RootDisk:  s.rootDisk,
-				MountPath: s.drivePath,
-				Endpoint:  s.endpoint.String(),
-			}
+func (s *xlStorage) DiskInfo(_ context.Context, _ DiskInfoOptions) (info DiskInfo, err error) {
+	s.diskInfoCache.InitOnce(time.Second, cachevalue.Opts{},
+		func() (DiskInfo, error) {
+			dcinfo := DiskInfo{}
 			di, err := getDiskInfo(s.drivePath)
 			if err != nil {
 				return dcinfo, err
@@ -680,8 +740,6 @@ func (s *xlStorage) DiskInfo(_ context.Context, _ bool) (info DiskInfo, err erro
 			dcinfo.UsedInodes = di.Files - di.Ffree
 			dcinfo.FreeInodes = di.Ffree
 			dcinfo.FSType = di.FSType
-			dcinfo.NRRequests = s.nrRequests
-			dcinfo.Rotational = s.rotational
 			diskID, err := s.GetDiskID()
 			// Healing is 'true' when
 			// - if we found an unformatted disk (no 'format.json')
@@ -689,14 +747,15 @@ func (s *xlStorage) DiskInfo(_ context.Context, _ bool) (info DiskInfo, err erro
 			dcinfo.Healing = errors.Is(err, errUnformattedDisk) || (s.Healing() != nil)
 			dcinfo.ID = diskID
 			return dcinfo, err
-		}
-	})
+		},
+	)
 
-	v, err := s.diskInfoCache.Get()
-	if v != nil {
-		info = v.(DiskInfo)
-	}
-	info.Scanning = scanning
+	info, err = s.diskInfoCache.Get()
+	info.NRRequests = s.nrRequests
+	info.Rotational = s.rotational
+	info.MountPath = s.drivePath
+	info.Endpoint = s.endpoint.String()
+	info.Scanning = atomic.LoadInt32(&s.scanning) == 1
 	return info, err
 }
 
@@ -713,8 +772,7 @@ func (s *xlStorage) getVolDir(volume string) (string, error) {
 }
 
 func (s *xlStorage) checkFormatJSON() (os.FileInfo, error) {
-	formatFile := pathJoin(s.drivePath, minioMetaBucket, formatConfigFile)
-	fi, err := Lstat(formatFile)
+	fi, err := Lstat(s.formatFile)
 	if err != nil {
 		// If the disk is still not initialized.
 		if osIsNotExist(err) {
@@ -728,12 +786,12 @@ func (s *xlStorage) checkFormatJSON() (os.FileInfo, error) {
 				return nil, errDiskAccessDenied
 			}
 			logger.LogOnceIf(GlobalContext, err, "check-format-json") // log unexpected errors
-			return nil, errCorruptedFormat
+			return nil, errCorruptedBackend
 		} else if osIsPermission(err) {
 			return nil, errDiskAccessDenied
 		}
 		logger.LogOnceIf(GlobalContext, err, "check-format-json") // log unexpected errors
-		return nil, errCorruptedFormat
+		return nil, errCorruptedBackend
 	}
 	return fi, nil
 }
@@ -765,8 +823,7 @@ func (s *xlStorage) GetDiskID() (string, error) {
 		return diskID, nil
 	}
 
-	formatFile := pathJoin(s.drivePath, minioMetaBucket, formatConfigFile)
-	b, err := os.ReadFile(formatFile)
+	b, err := os.ReadFile(s.formatFile)
 	if err != nil {
 		// If the disk is still not initialized.
 		if osIsNotExist(err) {
@@ -780,12 +837,12 @@ func (s *xlStorage) GetDiskID() (string, error) {
 				return "", errDiskAccessDenied
 			}
 			logger.LogOnceIf(GlobalContext, err, "check-format-json") // log unexpected errors
-			return "", errCorruptedFormat
+			return "", errCorruptedBackend
 		} else if osIsPermission(err) {
 			return "", errDiskAccessDenied
 		}
 		logger.LogOnceIf(GlobalContext, err, "check-format-json") // log unexpected errors
-		return "", errCorruptedFormat
+		return "", errCorruptedBackend
 	}
 
 	format := &formatErasureV3{}
@@ -950,9 +1007,21 @@ func (s *xlStorage) DeleteVol(ctx context.Context, volume string, forceDelete bo
 
 // ListDir - return all the entries at the given directory path.
 // If an entry is a directory it will be returned with a trailing SlashSeparator.
-func (s *xlStorage) ListDir(ctx context.Context, volume, dirPath string, count int) (entries []string, err error) {
+func (s *xlStorage) ListDir(ctx context.Context, origvolume, volume, dirPath string, count int) (entries []string, err error) {
 	if contextCanceled(ctx) {
 		return nil, ctx.Err()
+	}
+
+	if origvolume != "" {
+		if !skipAccessChecks(origvolume) {
+			origvolumeDir, err := s.getVolDir(origvolume)
+			if err != nil {
+				return nil, err
+			}
+			if err = Access(origvolumeDir); err != nil {
+				return nil, convertAccessError(err, errVolumeAccessDenied)
+			}
+		}
 	}
 
 	// Verify if volume is valid and it exists.
@@ -968,15 +1037,9 @@ func (s *xlStorage) ListDir(ctx context.Context, volume, dirPath string, count i
 		entries, err = readDir(dirPathAbs)
 	}
 	if err != nil {
-		if err == errFileNotFound {
-			if !skipAccessChecks(volume) {
-				if ierr := Access(volumeDir); ierr != nil {
-					if osIsNotExist(ierr) {
-						return nil, errVolumeNotFound
-					} else if isSysErrIO(ierr) {
-						return nil, errFaultyDisk
-					}
-				}
+		if errors.Is(err, errFileNotFound) && !skipAccessChecks(volume) {
+			if ierr := Access(volumeDir); ierr != nil {
+				return nil, convertAccessError(ierr, errVolumeAccessDenied)
 			}
 		}
 		return nil, err
@@ -991,8 +1054,10 @@ func (s *xlStorage) deleteVersions(ctx context.Context, volume, path string, fis
 		return err
 	}
 
+	discard := true
+
 	var legacyJSON bool
-	buf, _, err := s.readAllData(ctx, volume, volumeDir, pathJoin(volumeDir, path, xlStorageFormatFile), false)
+	buf, _, err := s.readAllData(ctx, volume, volumeDir, pathJoin(volumeDir, path, xlStorageFormatFile), discard)
 	if err != nil {
 		if !errors.Is(err, errFileNotFound) {
 			return err
@@ -1002,7 +1067,7 @@ func (s *xlStorage) deleteVersions(ctx context.Context, volume, path string, fis
 		legacy := s.formatLegacy
 		s.RUnlock()
 		if legacy {
-			buf, _, err = s.readAllData(ctx, volume, volumeDir, pathJoin(volumeDir, path, xlStorageFormatFileV1), false)
+			buf, _, err = s.readAllData(ctx, volume, volumeDir, pathJoin(volumeDir, path, xlStorageFormatFileV1), discard)
 			if err != nil {
 				return err
 			}
@@ -1011,6 +1076,11 @@ func (s *xlStorage) deleteVersions(ctx context.Context, volume, path string, fis
 	}
 
 	if len(buf) == 0 {
+		if errors.Is(err, errFileNotFound) && !skipAccessChecks(volume) {
+			if aerr := Access(volumeDir); aerr != nil && osIsNotExist(aerr) {
+				return errVolumeNotFound
+			}
+		}
 		return errFileNotFound
 	}
 
@@ -1072,12 +1142,12 @@ func (s *xlStorage) deleteVersions(ctx context.Context, volume, path string, fis
 		return s.WriteAll(ctx, volume, pathJoin(path, xlStorageFormatFile), buf)
 	}
 
-	return s.deleteFile(volumeDir, pathJoin(volumeDir, path), true, false)
+	return s.deleteFile(volumeDir, pathJoin(volumeDir, path, xlStorageFormatFile), true, false)
 }
 
 // DeleteVersions deletes slice of versions, it can be same object
 // or multiple objects.
-func (s *xlStorage) DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions) []error {
+func (s *xlStorage) DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions, opts DeleteOptions) []error {
 	errs := make([]error, len(versions))
 
 	for i, fiv := range versions {
@@ -1085,7 +1155,7 @@ func (s *xlStorage) DeleteVersions(ctx context.Context, volume string, versions 
 			errs[i] = ctx.Err()
 			continue
 		}
-		w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+		w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 		if err := w.Run(func() error { return s.deleteVersions(ctx, volume, fiv.Name, fiv.Versions...) }); err != nil {
 			errs[i] = err
 		}
@@ -1095,22 +1165,32 @@ func (s *xlStorage) DeleteVersions(ctx context.Context, volume string, versions 
 	return errs
 }
 
-func (s *xlStorage) moveToTrash(filePath string, recursive, force bool) error {
+func (s *xlStorage) moveToTrash(filePath string, recursive, immediatePurge bool) (err error) {
 	pathUUID := mustGetUUID()
 	targetPath := pathutil.Join(s.drivePath, minioMetaTmpDeletedBucket, pathUUID)
 
 	if recursive {
-		if err := renameAll(filePath, targetPath, s.drivePath); err != nil {
-			return err
-		}
+		err = renameAll(filePath, targetPath, pathutil.Join(s.drivePath, minioMetaBucket))
 	} else {
-		if err := Rename(filePath, targetPath); err != nil {
-			return err
+		err = Rename(filePath, targetPath)
+	}
+
+	// ENOSPC is a valid error from rename(); remove instead of rename in that case
+	if errors.Is(err, errDiskFull) || isSysErrNoSpace(err) {
+		if recursive {
+			err = removeAll(filePath)
+		} else {
+			err = Remove(filePath)
 		}
+		return err // Avoid the immediate purge since not needed
+	}
+
+	if err != nil {
+		return err
 	}
 
 	// immediately purge the target
-	if force {
+	if immediatePurge {
 		removeAll(targetPath)
 	}
 
@@ -1119,16 +1199,27 @@ func (s *xlStorage) moveToTrash(filePath string, recursive, force bool) error {
 
 // DeleteVersion - deletes FileInfo metadata for path at `xl.meta`. forceDelMarker
 // will force creating a new `xl.meta` to create a new delete marker
-func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) error {
+func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool, opts DeleteOptions) (err error) {
 	if HasSuffix(path, SlashSeparator) {
 		return s.Delete(ctx, volume, path, DeleteOptions{
 			Recursive: false,
-			Force:     false,
+			Immediate: false,
 		})
 	}
 
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return err
+	}
+
+	// Validate file path length, before reading.
+	filePath := pathJoin(volumeDir, path)
+	if err = checkPathLength(filePath); err != nil {
+		return err
+	}
+
 	var legacyJSON bool
-	buf, err := s.ReadAll(ctx, volume, pathJoin(path, xlStorageFormatFile))
+	buf, _, err := s.readAllData(ctx, volume, volumeDir, pathJoin(filePath, xlStorageFormatFile), true)
 	if err != nil {
 		if !errors.Is(err, errFileNotFound) {
 			return err
@@ -1136,7 +1227,7 @@ func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi F
 		metaDataPoolPut(buf) // Never used, return it
 		if fi.Deleted && forceDelMarker {
 			// Create a new xl.meta with a delete marker in it
-			return s.WriteMetadata(ctx, volume, path, fi)
+			return s.WriteMetadata(ctx, "", volume, path, fi)
 		}
 
 		s.RLock()
@@ -1159,11 +1250,6 @@ func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi F
 			return errFileVersionNotFound
 		}
 		return errFileNotFound
-	}
-
-	volumeDir, err := s.getVolDir(volume)
-	if err != nil {
-		return err
 	}
 
 	if legacyJSON {
@@ -1217,22 +1303,11 @@ func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi F
 		return s.WriteAll(ctx, volume, pathJoin(path, xlStorageFormatFile), buf)
 	}
 
-	// No more versions, this is the last version purge everything.
-	filePath := pathJoin(volumeDir, path)
-	if err = checkPathLength(filePath); err != nil {
-		return err
-	}
-
-	return s.deleteFile(volumeDir, filePath, true, false)
-}
-
-// UpdateMetadataOpts provides an optional input to indicate if xl.meta updates need to be fully synced to disk.
-type UpdateMetadataOpts struct {
-	NoPersistence bool
+	return s.deleteFile(volumeDir, pathJoin(volumeDir, path, xlStorageFormatFile), true, false)
 }
 
 // Updates only metadata for a given version.
-func (s *xlStorage) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo, opts UpdateMetadataOpts) error {
+func (s *xlStorage) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo, opts UpdateMetadataOpts) (err error) {
 	if len(fi.Metadata) == 0 {
 		return errInvalidArgument
 	}
@@ -1271,8 +1346,22 @@ func (s *xlStorage) UpdateMetadata(ctx context.Context, volume, path string, fi 
 }
 
 // WriteMetadata - writes FileInfo metadata for path at `xl.meta`
-func (s *xlStorage) WriteMetadata(ctx context.Context, volume, path string, fi FileInfo) error {
+func (s *xlStorage) WriteMetadata(ctx context.Context, origvolume, volume, path string, fi FileInfo) (err error) {
 	if fi.Fresh {
+		if origvolume != "" {
+			origvolumeDir, err := s.getVolDir(origvolume)
+			if err != nil {
+				return err
+			}
+
+			if !skipAccessChecks(origvolume) {
+				// Stat a volume entry.
+				if err = Access(origvolumeDir); err != nil {
+					return convertAccessError(err, errVolumeAccessDenied)
+				}
+			}
+		}
+
 		var xlMeta xlMetaV2
 		if err := xlMeta.AddVersion(fi); err != nil {
 			return err
@@ -1376,10 +1465,15 @@ func (s *xlStorage) renameLegacyMetadata(volumeDir, path string) (err error) {
 }
 
 func (s *xlStorage) readRaw(ctx context.Context, volume, volumeDir, filePath string, readData bool) (buf []byte, dmTime time.Time, err error) {
+	if filePath == "" {
+		return nil, dmTime, errFileNotFound
+	}
+
+	xlPath := pathJoin(filePath, xlStorageFormatFile)
 	if readData {
-		buf, dmTime, err = s.readAllData(ctx, volume, volumeDir, pathJoin(filePath, xlStorageFormatFile), true)
+		buf, dmTime, err = s.readAllData(ctx, volume, volumeDir, xlPath, false)
 	} else {
-		buf, dmTime, err = s.readMetadataWithDMTime(ctx, pathJoin(filePath, xlStorageFormatFile))
+		buf, dmTime, err = s.readMetadataWithDMTime(ctx, xlPath)
 		if err != nil {
 			if osIsNotExist(err) {
 				if !skipAccessChecks(volume) {
@@ -1392,18 +1486,21 @@ func (s *xlStorage) readRaw(ctx context.Context, volume, volumeDir, filePath str
 		}
 	}
 
-	if err != nil {
-		if err == errFileNotFound {
-			buf, dmTime, err = s.readAllData(ctx, volume, volumeDir, pathJoin(filePath, xlStorageFormatFileV1), true)
-			if err != nil {
-				return nil, time.Time{}, err
-			}
-		} else {
+	s.RLock()
+	legacy := s.formatLegacy
+	s.RUnlock()
+
+	if err != nil && errors.Is(err, errFileNotFound) && legacy {
+		buf, dmTime, err = s.readAllData(ctx, volume, volumeDir, pathJoin(filePath, xlStorageFormatFileV1), false)
+		if err != nil {
 			return nil, time.Time{}, err
 		}
 	}
 
 	if len(buf) == 0 {
+		if err != nil {
+			return nil, time.Time{}, err
+		}
 		return nil, time.Time{}, errFileNotFound
 	}
 
@@ -1424,28 +1521,50 @@ func (s *xlStorage) ReadXL(ctx context.Context, volume, path string, readData bo
 		return RawFileInfo{}, err
 	}
 
-	buf, dmTime, err := s.readRaw(ctx, volume, volumeDir, filePath, readData)
+	buf, _, err := s.readRaw(ctx, volume, volumeDir, filePath, readData)
 	return RawFileInfo{
-		Buf:       buf,
-		DiskMTime: dmTime,
+		Buf: buf,
 	}, err
+}
+
+// ReadOptions optional inputs for ReadVersion
+type ReadOptions struct {
+	ReadData bool
+	Healing  bool
 }
 
 // ReadVersion - reads metadata and returns FileInfo at path `xl.meta`
 // for all objects less than `32KiB` this call returns data as well
 // along with metadata.
-func (s *xlStorage) ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (fi FileInfo, err error) {
+func (s *xlStorage) ReadVersion(ctx context.Context, origvolume, volume, path, versionID string, opts ReadOptions) (fi FileInfo, err error) {
+	if origvolume != "" {
+		origvolumeDir, err := s.getVolDir(origvolume)
+		if err != nil {
+			return fi, err
+		}
+
+		if !skipAccessChecks(origvolume) {
+			// Stat a volume entry.
+			if err = Access(origvolumeDir); err != nil {
+				return fi, convertAccessError(err, errVolumeAccessDenied)
+			}
+		}
+	}
+
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return fi, err
 	}
+
 	// Validate file path length, before reading.
 	filePath := pathJoin(volumeDir, path)
 	if err = checkPathLength(filePath); err != nil {
 		return fi, err
 	}
 
-	buf, dmTime, err := s.readRaw(ctx, volume, volumeDir, filePath, readData)
+	readData := opts.ReadData
+
+	buf, _, err := s.readRaw(ctx, volume, volumeDir, filePath, readData)
 	if err != nil {
 		if err == errFileNotFound {
 			if versionID != "" {
@@ -1459,7 +1578,6 @@ func (s *xlStorage) ReadVersion(ctx context.Context, volume, path, versionID str
 	if err != nil {
 		return fi, err
 	}
-	fi.DiskMTime = dmTime
 
 	if len(fi.Data) == 0 {
 		// We did not read inline data, so we have no references.
@@ -1478,9 +1596,9 @@ func (s *xlStorage) ReadVersion(ctx context.Context, volume, path, versionID str
 				return fi, nil
 			}
 
-			// For overwritten objects without header we might have a conflict with
-			// data written later.
-			// Check the data path if there is a part with data.
+			// For overwritten objects without header we might have a
+			// conflict with data written later. Check the data path
+			// if there is a part with data.
 			partPath := fmt.Sprintf("part.%d", fi.Parts[0].Number)
 			dataPath := pathJoin(path, fi.DataDir, partPath)
 			_, lerr := Lstat(pathJoin(volumeDir, dataPath))
@@ -1502,28 +1620,42 @@ func (s *xlStorage) ReadVersion(ctx context.Context, volume, path, versionID str
 			len(fi.Parts) == 1 {
 			partPath := fmt.Sprintf("part.%d", fi.Parts[0].Number)
 			dataPath := pathJoin(volumeDir, path, fi.DataDir, partPath)
-			fi.Data, _, err = s.readAllData(ctx, volume, volumeDir, dataPath, true)
+			fi.Data, _, err = s.readAllData(ctx, volume, volumeDir, dataPath, false)
 			if err != nil {
 				return FileInfo{}, err
 			}
 		}
 	}
 
+	if !skipAccessChecks(volume) && !opts.Healing && fi.TransitionStatus == "" && !fi.InlineData() && len(fi.Data) == 0 && fi.DataDir != "" && fi.DataDir != emptyUUID && fi.VersionPurgeStatus().Empty() {
+		// Verify if the dataDir is present or not when the data
+		// is not inlined to make sure we return correct errors
+		// during HeadObject().
+
+		// Healing must not come here and return error, since healing
+		// deals with dataDirs directly, let healing fix things automatically.
+		if lerr := Access(pathJoin(volumeDir, path, fi.DataDir)); lerr != nil {
+			if os.IsNotExist(lerr) {
+				// Data dir is missing we must return errFileCorrupted
+				return FileInfo{}, errFileCorrupt
+			}
+			return FileInfo{}, osErrToFileErr(lerr)
+		}
+	}
+
 	return fi, nil
 }
 
-func (s *xlStorage) readAllData(ctx context.Context, volume, volumeDir string, filePath string, sync bool) (buf []byte, dmTime time.Time, err error) {
+func (s *xlStorage) readAllData(ctx context.Context, volume, volumeDir string, filePath string, discard bool) (buf []byte, dmTime time.Time, err error) {
+	if filePath == "" {
+		return nil, dmTime, errFileNotFound
+	}
+
 	if contextCanceled(ctx) {
 		return nil, time.Time{}, ctx.Err()
 	}
 
-	odirectEnabled := globalAPIConfig.odirectEnabled() && s.oDirect
-	var f *os.File
-	if odirectEnabled && sync {
-		f, err = OpenFileDirectIO(filePath, readMode, 0o666)
-	} else {
-		f, err = OpenFile(filePath, readMode, 0o666)
-	}
+	f, err := OpenFile(filePath, readMode, 0o666)
 	if err != nil {
 		switch {
 		case osIsNotExist(err):
@@ -1558,23 +1690,20 @@ func (s *xlStorage) readAllData(ctx context.Context, volume, volumeDir string, f
 		}
 		return nil, dmTime, err
 	}
-	r := io.Reader(f)
-	var dr *xioutil.ODirectReader
-	if odirectEnabled {
-		dr = &xioutil.ODirectReader{
-			File:      f,
-			SmallFile: true,
-		}
-		defer dr.Close()
-		r = dr
-	} else {
-		defer f.Close()
+
+	if discard {
+		// This discard is mostly true for DELETEEs
+		// so we need to make sure we do not keep
+		// page-cache references after.
+		defer disk.Fdatasync(f)
 	}
+
+	defer f.Close()
 
 	// Get size for precise allocation.
 	stat, err := f.Stat()
 	if err != nil {
-		buf, err = io.ReadAll(diskHealthReader(ctx, r))
+		buf, err = io.ReadAll(f)
 		return buf, dmTime, osErrToFileErr(err)
 	}
 	if stat.IsDir() {
@@ -1589,11 +1718,9 @@ func (s *xlStorage) readAllData(ctx context.Context, volume, volumeDir string, f
 	} else {
 		buf = make([]byte, sz)
 	}
-	if dr != nil {
-		dr.SmallFile = sz <= xioutil.BlockSizeSmall*2
-	}
+
 	// Read file...
-	_, err = io.ReadFull(diskHealthReader(ctx, r), buf)
+	_, err = io.ReadFull(f, buf)
 
 	return buf, stat.ModTime().UTC(), osErrToFileErr(err)
 }
@@ -1622,7 +1749,7 @@ func (s *xlStorage) ReadAll(ctx context.Context, volume string, path string) (bu
 		return nil, err
 	}
 
-	buf, _, err = s.readAllData(ctx, volume, volumeDir, filePath, true)
+	buf, _, err = s.readAllData(ctx, volume, volumeDir, filePath, false)
 	return buf, err
 }
 
@@ -1869,7 +1996,21 @@ func (c closeWrapper) Close() error {
 }
 
 // CreateFile - creates the file.
-func (s *xlStorage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) (err error) {
+func (s *xlStorage) CreateFile(ctx context.Context, origvolume, volume, path string, fileSize int64, r io.Reader) (err error) {
+	if origvolume != "" {
+		origvolumeDir, err := s.getVolDir(origvolume)
+		if err != nil {
+			return err
+		}
+
+		if !skipAccessChecks(origvolume) {
+			// Stat a volume entry.
+			if err = Access(origvolumeDir); err != nil {
+				return convertAccessError(err, errVolumeAccessDenied)
+			}
+		}
+	}
+
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return err
@@ -2116,7 +2257,7 @@ func (s *xlStorage) CheckParts(ctx context.Context, volume string, path string, 
 // move up the tree, deleting empty parent directories until it finds one
 // with files in it. Returns nil for a non-empty directory even when
 // recursive is set to false.
-func (s *xlStorage) deleteFile(basePath, deletePath string, recursive, force bool) error {
+func (s *xlStorage) deleteFile(basePath, deletePath string, recursive, immediate bool) error {
 	if basePath == "" || deletePath == "" {
 		return nil
 	}
@@ -2129,7 +2270,7 @@ func (s *xlStorage) deleteFile(basePath, deletePath string, recursive, force boo
 
 	var err error
 	if recursive {
-		err = s.moveToTrash(deletePath, true, force)
+		err = s.moveToTrash(deletePath, true, immediate)
 	} else {
 		err = Remove(deletePath)
 	}
@@ -2145,7 +2286,7 @@ func (s *xlStorage) deleteFile(basePath, deletePath string, recursive, force boo
 			if runtime.GOOS == globalMacOSName {
 				storeFilePath := pathJoin(deletePath, ".DS_Store")
 				_, err := Stat(storeFilePath)
-				// .DS_Store exsits
+				// .DS_Store exists
 				if err == nil {
 					// delete first
 					Remove(storeFilePath)
@@ -2201,15 +2342,15 @@ func (s *xlStorage) Delete(ctx context.Context, volume string, path string, dele
 	}
 
 	// Delete file and delete parent directory as well if it's empty.
-	return s.deleteFile(volumeDir, filePath, deleteOpts.Recursive, deleteOpts.Force)
+	return s.deleteFile(volumeDir, filePath, deleteOpts.Recursive, deleteOpts.Immediate)
 }
 
 func skipAccessChecks(volume string) (ok bool) {
 	for _, prefix := range []string{
-		minioMetaBucket,
-		minioMetaMultipartBucket,
 		minioMetaTmpDeletedBucket,
 		minioMetaTmpBucket,
+		minioMetaMultipartBucket,
+		minioMetaBucket,
 	} {
 		if strings.HasPrefix(volume, prefix) {
 			return true
@@ -2219,7 +2360,7 @@ func skipAccessChecks(volume string) (ok bool) {
 }
 
 // RenameData - rename source path to destination path atomically, metadata and data directory.
-func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) (sign uint64, err error) {
+func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (sign uint64, err error) {
 	defer func() {
 		ignoredErrs := []error{
 			errFileNotFound,
@@ -2228,6 +2369,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 			errDiskNotFound,
 			errUnformattedDisk,
 			errMaxVersionsExceeded,
+			errFileAccessDenied,
 		}
 		if err != nil && !IsErr(err, ignoredErrs...) && !contextCanceled(ctx) {
 			// Only log these errors if context is not yet canceled.
@@ -2235,9 +2377,9 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 				s.drivePath,
 				srcVolume, srcPath,
 				dstVolume, dstPath,
-				err), "xl-storage-rename-data-"+srcVolume+"-"+dstVolume)
+				err), "xl-storage-rename-data-"+dstVolume)
 		}
-		if err == nil && s.globalSync {
+		if s.globalSync {
 			globalSync()
 		}
 	}()
@@ -2255,23 +2397,13 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	if !skipAccessChecks(srcVolume) {
 		// Stat a volume entry.
 		if err = Access(srcVolumeDir); err != nil {
-			if osIsNotExist(err) {
-				return 0, errVolumeNotFound
-			} else if isSysErrIO(err) {
-				return 0, errFaultyDisk
-			}
-			return 0, err
+			return 0, convertAccessError(err, errVolumeAccessDenied)
 		}
 	}
 
 	if !skipAccessChecks(dstVolume) {
 		if err = Access(dstVolumeDir); err != nil {
-			if osIsNotExist(err) {
-				return 0, errVolumeNotFound
-			} else if isSysErrIO(err) {
-				return 0, errFaultyDisk
-			}
-			return 0, err
+			return 0, convertAccessError(err, errVolumeAccessDenied)
 		}
 	}
 
@@ -2355,7 +2487,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		formatLegacy := s.formatLegacy
 		s.RUnlock()
 		// It is possible that some drives may not have `xl.meta` file
-		// in such scenarios verify if atleast `part.1` files exist
+		// in such scenarios verify if at least `part.1` files exist
 		// to verify for legacy version.
 		if formatLegacy {
 			// We only need this code if we are moving
@@ -2389,7 +2521,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		}
 
 		// legacy data dir means its old content, honor system umask.
-		if err = mkdirAll(legacyDataPath, 0o777, s.drivePath); err != nil {
+		if err = mkdirAll(legacyDataPath, 0o777, dstVolumeDir); err != nil {
 			// any failed mkdir-calls delete them.
 			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 			return 0, osErrToFileErr(err)
@@ -2475,74 +2607,53 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	defer metaDataPoolPut(dstBuf)
 	if err != nil {
 		if legacyPreserved {
-			// Any failed rename calls un-roll previous transaction.
 			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 		}
 		return 0, errFileCorrupt
 	}
 
-	if srcDataPath != "" {
-		if err = s.WriteAll(ctx, srcVolume, pathJoin(srcPath, xlStorageFormatFile), dstBuf); err != nil {
-			if legacyPreserved {
-				// Any failed rename calls un-roll previous transaction.
-				s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
-			}
-			return 0, osErrToFileErr(err)
+	if err = s.WriteAll(ctx, srcVolume, pathJoin(srcPath, xlStorageFormatFile), dstBuf); err != nil {
+		if legacyPreserved {
+			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 		}
-		diskHealthCheckOK(ctx, err)
+		return 0, osErrToFileErr(err)
+	}
+	diskHealthCheckOK(ctx, err)
 
-		if !fi.Versioned && !fi.Healing() {
-			// Use https://man7.org/linux/man-pages/man2/rename.2.html if possible on unversioned bucket.
-			if err := Rename2(pathutil.Join(srcVolumeDir, srcPath), pathutil.Join(dstVolumeDir, dstPath)); err == nil {
-				return sign, nil
-			} // if Rename2 is not successful fallback.
-		}
-
+	if srcDataPath != "" && len(fi.Data) == 0 && fi.Size > 0 {
 		// renameAll only for objects that have xl.meta not saved inline.
-		if len(fi.Data) == 0 && fi.Size > 0 {
-			s.moveToTrash(dstDataPath, true, false)
-			if healing {
-				// If we are healing we should purge any legacyDataPath content,
-				// that was previously preserved during PutObject() call
-				// on a versioned bucket.
-				s.moveToTrash(legacyDataPath, true, false)
-			}
-			if err = renameAll(srcDataPath, dstDataPath, s.drivePath); err != nil {
-				if legacyPreserved {
-					// Any failed rename calls un-roll previous transaction.
-					s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
-				}
-				s.deleteFile(dstVolumeDir, dstDataPath, false, false)
-				return 0, osErrToFileErr(err)
-			}
+		s.moveToTrash(dstDataPath, true, false)
+		if healing {
+			// If we are healing we should purge any legacyDataPath content,
+			// that was previously preserved during PutObject() call
+			// on a versioned bucket.
+			s.moveToTrash(legacyDataPath, true, false)
 		}
-
-		// Commit meta-file
-		if err = renameAll(srcFilePath, dstFilePath, s.drivePath); err != nil {
+		if err = renameAll(srcDataPath, dstDataPath, dstVolumeDir); err != nil {
 			if legacyPreserved {
 				// Any failed rename calls un-roll previous transaction.
 				s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 			}
-			s.deleteFile(dstVolumeDir, dstFilePath, false, false)
+			s.deleteFile(dstVolumeDir, dstDataPath, false, false)
 			return 0, osErrToFileErr(err)
 		}
+	}
 
-		// additionally only purge older data at the end of the transaction of new data-dir
-		// movement, this is to ensure that previous data references can co-exist for
-		// any recoverability.
-		if oldDstDataPath != "" {
-			s.moveToTrash(oldDstDataPath, true, false)
+	// Commit meta-file
+	if err = renameAll(srcFilePath, dstFilePath, dstVolumeDir); err != nil {
+		if legacyPreserved {
+			// Any failed rename calls un-roll previous transaction.
+			s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 		}
-	} else {
-		// Write meta-file directly, no data
-		if err = s.WriteAll(ctx, dstVolume, pathJoin(dstPath, xlStorageFormatFile), dstBuf); err != nil {
-			if legacyPreserved {
-				// Any failed rename calls un-roll previous transaction.
-				s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
-			}
-			s.deleteFile(dstVolumeDir, dstFilePath, false, false)
-			return 0, err
-		}
+		s.deleteFile(dstVolumeDir, dstDataPath, false, false)
+		return 0, osErrToFileErr(err)
+	}
+
+	// additionally only purge older data at the end of the transaction of new data-dir
+	// movement, this is to ensure that previous data references can co-exist for
+	// any recoverability.
+	if oldDstDataPath != "" {
+		s.moveToTrash(oldDstDataPath, true, false)
 	}
 
 	if srcVolume != minioMetaMultipartBucket {
@@ -2628,7 +2739,7 @@ func (s *xlStorage) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolum
 		}
 	}
 
-	if err = renameAll(srcFilePath, dstFilePath, s.drivePath); err != nil {
+	if err = renameAll(srcFilePath, dstFilePath, dstVolumeDir); err != nil {
 		if isSysErrNotEmpty(err) || isSysErrNotDir(err) {
 			return errFileAccessDenied
 		}
@@ -2703,7 +2814,7 @@ func (s *xlStorage) VerifyFile(ctx context.Context, volume, path string, fi File
 // The resp channel is closed before the call returns.
 // Only a canceled context will return an error.
 func (s *xlStorage) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) error {
-	defer close(resp)
+	defer xioutil.SafeClose(resp)
 
 	volumeDir := pathJoin(s.drivePath, req.Bucket)
 	found := 0
@@ -2719,12 +2830,12 @@ func (s *xlStorage) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp 
 		var data []byte
 		var mt time.Time
 		fullPath := pathJoin(volumeDir, req.Prefix, f)
-		w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+		w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 		if err := w.Run(func() (err error) {
 			if req.MetadataOnly {
 				data, mt, err = s.readMetadataWithDMTime(ctx, fullPath)
 			} else {
-				data, mt, err = s.readAllData(ctx, req.Bucket, volumeDir, fullPath, false)
+				data, mt, err = s.readAllData(ctx, req.Bucket, volumeDir, fullPath, true)
 			}
 			return err
 		}); err != nil {
@@ -2748,14 +2859,22 @@ func (s *xlStorage) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp 
 		if req.MaxSize > 0 && int64(len(data)) > req.MaxSize {
 			r.Exists = true
 			r.Error = fmt.Sprintf("max size (%d) exceeded: %d", req.MaxSize, len(data))
-			resp <- r
-			continue
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case resp <- r:
+				continue
+			}
 		}
 		found++
 		r.Exists = true
 		r.Data = data
 		r.Modtime = mt
-		resp <- r
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case resp <- r:
+		}
 		if req.MaxResults > 0 && found >= req.MaxResults {
 			return nil
 		}
@@ -2819,7 +2938,7 @@ func (s *xlStorage) CleanAbandonedData(ctx context.Context, volume string, path 
 	}
 	baseDir := pathJoin(volumeDir, path+slashSeparator)
 	metaPath := pathutil.Join(baseDir, xlStorageFormatFile)
-	buf, _, err := s.readAllData(ctx, volume, volumeDir, metaPath, false)
+	buf, _, err := s.readAllData(ctx, volume, volumeDir, metaPath, true)
 	if err != nil {
 		return err
 	}

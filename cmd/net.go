@@ -98,7 +98,12 @@ func mustGetLocalIP6() (ipList set.StringSet) {
 
 // getHostIP returns IP address of given host.
 func getHostIP(host string) (ipList set.StringSet, err error) {
-	addrs, err := globalDNSCache.LookupHost(GlobalContext, host)
+	lookupHost := globalDNSCache.LookupHost
+	if IsKubernetes() || IsDocker() {
+		lookupHost = net.DefaultResolver.LookupHost
+	}
+
+	addrs, err := lookupHost(GlobalContext, host)
 	if err != nil {
 		return ipList, err
 	}
@@ -111,9 +116,9 @@ func getHostIP(host string) (ipList set.StringSet, err error) {
 	return ipList, err
 }
 
-// sortIPs - sort ips based on higher octects.
+// sortIPs - sort ips based on higher octets.
 // The logic to sort by last octet is implemented to
-// prefer CIDRs with higher octects, this in-turn skips the
+// prefer CIDRs with higher octets, this in-turn skips the
 // localhost/loopback address to be not preferred as the
 // first ip on the list. Subsequently this list helps us print
 // a user friendly message with appropriate values.

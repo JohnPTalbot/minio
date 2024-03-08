@@ -37,9 +37,12 @@ import (
 	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/hash"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/console"
 )
+
+//go:generate msgp -file $GOFILE -unexported
 
 type listPathOptions struct {
 	// ID of the listing.
@@ -98,18 +101,18 @@ type listPathOptions struct {
 
 	// Versioning config is used for if the path
 	// has versioning enabled.
-	Versioning *versioning.Versioning
+	Versioning *versioning.Versioning `msg:"-"`
 
 	// Lifecycle performs filtering based on lifecycle.
 	// This will filter out objects if the most recent version should be deleted by lifecycle.
 	// Is not transferred across request calls.
-	Lifecycle *lifecycle.Lifecycle
+	Lifecycle *lifecycle.Lifecycle `msg:"-"`
 
 	// Retention configuration, needed to be passed along with lifecycle if set.
-	Retention lock.Retention
+	Retention lock.Retention `msg:"-"`
 
 	// Replication configuration
-	Replication replicationConfig
+	Replication replicationConfig `msg:"-"`
 
 	// StopDiskAtLimit will stop listing on each disk when limit number off objects has been returned.
 	StopDiskAtLimit bool
@@ -216,7 +219,10 @@ func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCache
 				// Do not return io.EOF
 				if resCh != nil {
 					resErr = nil
-					resCh <- results
+					select {
+					case resCh <- results:
+					case <-ctx.Done():
+					}
 					resCh = nil
 					returned = true
 				}
@@ -426,8 +432,8 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 				if !disk.IsOnline() {
 					continue
 				}
-				_, err := disk.ReadVersion(ctx, minioMetaBucket,
-					o.objectPath(0), "", false)
+				_, err := disk.ReadVersion(ctx, "", minioMetaBucket,
+					o.objectPath(0), "", ReadOptions{})
 				if err != nil {
 					time.Sleep(retryDelay250)
 					retries++
@@ -503,8 +509,8 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 						if !disk.IsOnline() {
 							continue
 						}
-						_, err := disk.ReadVersion(ctx, minioMetaBucket,
-							o.objectPath(partN), "", false)
+						_, err := disk.ReadVersion(ctx, "", minioMetaBucket,
+							o.objectPath(partN), "", ReadOptions{})
 						if err != nil {
 							time.Sleep(retryDelay250)
 							retries++
@@ -590,25 +596,115 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 func getListQuorum(quorum string, driveCount int) int {
 	switch quorum {
 	case "disk":
-		// smallest possible value, generally meant for testing.
 		return 1
 	case "reduced":
 		return 2
 	case "optimal":
 		return (driveCount + 1) / 2
+	case "auto":
+		return -1
 	}
 	// defaults to 'strict'
 	return driveCount
 }
 
+func calcCommonWritesDeletes(infos []DiskInfo, readQuorum int) (commonWrite, commonDelete uint64) {
+	deletes := make([]uint64, len(infos))
+	writes := make([]uint64, len(infos))
+	for index, di := range infos {
+		deletes[index] = di.Metrics.TotalDeletes
+		writes[index] = di.Metrics.TotalWrites
+	}
+
+	filter := func(list []uint64) (commonCount uint64) {
+		max := 0
+		signatureMap := map[uint64]int{}
+		for _, v := range list {
+			signatureMap[v]++
+		}
+		for ops, count := range signatureMap {
+			if max < count && commonCount < ops {
+				max = count
+				commonCount = ops
+			}
+		}
+		if max < readQuorum {
+			return 0
+		}
+		return commonCount
+	}
+
+	commonWrite = filter(writes)
+	commonDelete = filter(deletes)
+	return
+}
+
+func calcCommonCounter(infos []DiskInfo, readQuorum int) (commonCount uint64) {
+	filter := func() (commonCount uint64) {
+		max := 0
+		signatureMap := map[uint64]int{}
+		for _, info := range infos {
+			if info.Error != "" {
+				continue
+			}
+			mutations := info.Metrics.TotalDeletes + info.Metrics.TotalWrites
+			signatureMap[mutations]++
+		}
+		for ops, count := range signatureMap {
+			if max < count && commonCount < ops {
+				max = count
+				commonCount = ops
+			}
+		}
+		if max < readQuorum {
+			return 0
+		}
+		return commonCount
+	}
+
+	return filter()
+}
+
+func getQuorumDiskInfos(disks []StorageAPI, infos []DiskInfo, readQuorum int) (newDisks []StorageAPI, newInfos []DiskInfo) {
+	commonMutations := calcCommonCounter(infos, readQuorum)
+	for i, info := range infos {
+		mutations := info.Metrics.TotalDeletes + info.Metrics.TotalWrites
+		if mutations >= commonMutations {
+			newDisks = append(newDisks, disks[i])
+			newInfos = append(newInfos, infos[i])
+		}
+	}
+
+	return newDisks, newInfos
+}
+
+func getQuorumDisks(disks []StorageAPI, infos []DiskInfo, readQuorum int) (newDisks []StorageAPI) {
+	newDisks, _ = getQuorumDiskInfos(disks, infos, readQuorum)
+	return newDisks
+}
+
 // Will return io.EOF if continuing would not yield more results.
 func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) (err error) {
-	defer close(results)
+	defer xioutil.SafeClose(results)
 	o.debugf(color.Green("listPath:")+" with options: %#v", o)
 
-	// get non-healing disks for listing
-	disks, _ := er.getOnlineDisksWithHealing()
+	// get prioritized non-healing disks for listing
+	disks, infos, _ := er.getOnlineDisksWithHealingAndInfo(true)
 	askDisks := getListQuorum(o.AskDisks, er.setDriveCount)
+	if askDisks == -1 {
+		newDisks := getQuorumDisks(disks, infos, (len(disks)+1)/2)
+		if newDisks != nil {
+			// If we found disks signature in quorum, we proceed to list
+			// from a single drive, shuffling of the drives is subsequently.
+			disks = newDisks
+			askDisks = 1
+		} else {
+			// If we did not find suitable disks, perform strict quorum listing
+			// as no disk agrees on quorum anymore.
+			askDisks = getListQuorum("strict", er.setDriveCount)
+		}
+	}
+
 	var fallbackDisks []StorageAPI
 
 	// Special case: ask all disks if the drive count is 4
@@ -676,6 +772,7 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 	})
 }
 
+//msgp:ignore metaCacheRPC
 type metaCacheRPC struct {
 	o      listPathOptions
 	mu     sync.Mutex
@@ -826,6 +923,7 @@ func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCache
 	return nil
 }
 
+//msgp:ignore listPathRawOptions
 type listPathRawOptions struct {
 	disks         []StorageAPI
 	fallbackDisks []StorageAPI
@@ -966,7 +1064,7 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 	for {
 		// Get the top entry from each
 		var current metaCacheEntry
-		var atEOF, fnf, hasErr, agree int
+		var atEOF, fnf, vnf, hasErr, agree int
 		for i := range topEntries {
 			topEntries[i] = metaCacheEntry{}
 		}
@@ -992,6 +1090,11 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 					errDiskNotFound.Error():
 					atEOF++
 					fnf++
+					// This is a special case, to handle bucket does
+					// not exist situations.
+					if errors.Is(err, errVolumeNotFound) {
+						vnf++
+					}
 					continue
 				}
 				hasErr++
@@ -1049,6 +1152,10 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			return errors.New(strings.Join(combinedErr, ", "))
 		}
 
+		if vnf == len(readers) {
+			return errVolumeNotFound
+		}
+
 		// Break if all at EOF or error.
 		if atEOF+hasErr == len(readers) {
 			if hasErr > 0 && opts.finished != nil {
@@ -1056,9 +1163,11 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			}
 			break
 		}
+
 		if fnf == len(readers) {
 			return errFileNotFound
 		}
+
 		if agree == len(readers) {
 			// Everybody agreed
 			for _, r := range readers {

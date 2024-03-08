@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
@@ -38,31 +37,13 @@ type partialOperation struct {
 	allVersions         bool
 	setIndex, poolIndex int
 	queued              time.Time
+	scanMode            madmin.HealScanMode
 }
 
 // mrfState sncapsulates all the information
 // related to the global background MRF.
 type mrfState struct {
-	ctx   context.Context
-	pools *erasureServerPools
-
-	mu   sync.Mutex
 	opCh chan partialOperation
-}
-
-// Initialize healing MRF subsystem
-func (m *mrfState) init(ctx context.Context, objAPI ObjectLayer) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.ctx = ctx
-	m.opCh = make(chan partialOperation, mrfOpsQueueSize)
-
-	var ok bool
-	m.pools, ok = objAPI.(*erasureServerPools)
-	if ok {
-		go m.healRoutine()
-	}
 }
 
 // Add a partial S3 operation (put/delete) when one or more disks are offline.
@@ -82,10 +63,10 @@ var healSleeper = newDynamicSleeper(5, time.Second, false)
 // healRoutine listens to new disks reconnection events and
 // issues healing requests for queued objects belonging to the
 // corresponding erasure set
-func (m *mrfState) healRoutine() {
+func (m *mrfState) healRoutine(z *erasureServerPools) {
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-GlobalContext.Done():
 			return
 		case u, ok := <-m.opCh:
 			if !ok {
@@ -97,28 +78,27 @@ func (m *mrfState) healRoutine() {
 				// let recently failed networks to reconnect
 				// making MRF wait for 1s before retrying,
 				// i.e 4 reconnect attempts.
-				time.Sleep(1 * time.Second)
+				time.Sleep(time.Second)
 			}
 
 			// wait on timer per heal
 			wait := healSleeper.Timer(context.Background())
 
+			scan := madmin.HealNormalScan
+			if u.scanMode != 0 {
+				scan = u.scanMode
+			}
 			if u.object == "" {
-				healBucket(u.bucket, madmin.HealNormalScan)
+				healBucket(u.bucket, scan)
 			} else {
 				if u.allVersions {
-					m.pools.serverPools[u.poolIndex].sets[u.setIndex].listAndHeal(u.bucket, u.object, healObjectVersionsDisparity)
+					z.serverPools[u.poolIndex].sets[u.setIndex].listAndHeal(u.bucket, u.object, u.scanMode, healObjectVersionsDisparity)
 				} else {
-					healObject(u.bucket, u.object, u.versionID, madmin.HealNormalScan)
+					healObject(u.bucket, u.object, u.versionID, scan)
 				}
 			}
 
 			wait()
 		}
 	}
-}
-
-// Initialize healing MRF
-func initHealMRF(ctx context.Context, obj ObjectLayer) {
-	globalMRFState.init(ctx, obj)
 }

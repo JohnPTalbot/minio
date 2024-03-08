@@ -6,10 +6,13 @@ exit_1() {
 
 	echo "minio1 ============"
 	cat /tmp/minio1_1.log
+	cat /tmp/minio1_2.log
 	echo "minio2 ============"
 	cat /tmp/minio2_1.log
+	cat /tmp/minio2_2.log
 	echo "minio3 ============"
 	cat /tmp/minio3_1.log
+	cat /tmp/minio3_2.log
 
 	exit 1
 }
@@ -241,6 +244,19 @@ if [ "${expected_checksum}" != "${actual_checksum}" ]; then
 	exit
 fi
 rm ./lrgfile
+
+./mc rm -r --versions --force minio1/newbucket/lrgfile
+if [ $? -ne 0 ]; then
+	echo "expected object to be present, exiting.."
+	exit_1
+fi
+
+sleep 5
+./mc stat minio1/newbucket/lrgfile
+if [ $? -eq 0 ]; then
+	echo "expected object to be deleted permanently after replication, exiting.."
+	exit_1
+fi
 
 vID=$(./mc stat minio2/newbucket/README.md --json | jq .versionID)
 if [ $? -ne 0 ]; then

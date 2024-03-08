@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2023 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -33,11 +33,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	jsoniter "github.com/json-iterator/go"
 	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
 	xnet "github.com/minio/pkg/v2/net"
+	"github.com/valyala/bytebufferpool"
 )
 
 const (
@@ -46,6 +49,9 @@ const (
 
 	// maxWorkers is the maximum number of concurrent http loggers
 	maxWorkers = 16
+
+	// maxWorkers is the maximum number of concurrent batch http loggers
+	maxWorkersWithBatchEvents = 4
 
 	// the suffix for the configured queue dir where the logs will be persisted.
 	httpLoggerExtension = ".http.log"
@@ -66,6 +72,7 @@ type Config struct {
 	AuthToken  string            `json:"authToken"`
 	ClientCert string            `json:"clientCert"`
 	ClientKey  string            `json:"clientKey"`
+	BatchSize  int               `json:"batchSize"`
 	QueueSize  int               `json:"queueSize"`
 	QueueDir   string            `json:"queueDir"`
 	Proxy      string            `json:"string"`
@@ -97,6 +104,13 @@ type Target struct {
 	// Sending a value on logCh must hold read lock on logChMu (to avoid closing)
 	logCh   chan interface{}
 	logChMu sync.RWMutex
+
+	// Number of events per HTTP send to webhook target
+	// this is ideally useful only if your endpoint can
+	// support reading multiple events on a stream for example
+	// like : Splunk HTTP Event collector, if you are unsure
+	// set this to '1'.
+	batchSize int
 
 	// If the first init fails, this starts a goroutine that
 	// will attempt to establish the connection.
@@ -134,9 +148,13 @@ func (h *Target) IsOnline(ctx context.Context) bool {
 
 // ping returns true if the target is reachable.
 func (h *Target) ping(ctx context.Context) bool {
-	if err := h.send(ctx, []byte(`{}`), webhookCallTimeout); err != nil {
+	if err := h.send(ctx, []byte(`{}`), "application/json", webhookCallTimeout); err != nil {
 		return !xnet.IsNetworkOrHostDown(err, false) && !xnet.IsConnRefusedErr(err)
 	}
+	// We are online.
+	h.workerStartMu.Lock()
+	h.lastStarted = time.Now()
+	h.workerStartMu.Unlock()
 	go h.startHTTPLogger(ctx)
 	return true
 }
@@ -198,14 +216,6 @@ func (h *Target) init(ctx context.Context) (err error) {
 						return
 					}
 					if h.ping(ctx) {
-						// We are online.
-						if atomic.CompareAndSwapInt32(&h.status, statusOffline, statusOnline) {
-							h.workerStartMu.Lock()
-							h.lastStarted = time.Now()
-							h.workerStartMu.Unlock()
-							atomic.AddInt64(&h.workers, 1)
-							go h.startHTTPLogger(ctx)
-						}
 						return
 					}
 				}
@@ -213,18 +223,10 @@ func (h *Target) init(ctx context.Context) (err error) {
 		})
 		return err
 	}
-
-	if atomic.CompareAndSwapInt32(&h.status, statusOffline, statusOnline) {
-		h.workerStartMu.Lock()
-		h.lastStarted = time.Now()
-		h.workerStartMu.Unlock()
-		atomic.AddInt64(&h.workers, 1)
-		go h.startHTTPLogger(ctx)
-	}
 	return nil
 }
 
-func (h *Target) send(ctx context.Context, payload []byte, timeout time.Duration) (err error) {
+func (h *Target) send(ctx context.Context, payload []byte, payloadType string, timeout time.Duration) (err error) {
 	defer func() {
 		if err != nil {
 			atomic.StoreInt32(&h.status, statusOffline)
@@ -240,7 +242,9 @@ func (h *Target) send(ctx context.Context, payload []byte, timeout time.Duration
 	if err != nil {
 		return fmt.Errorf("invalid configuration for '%s'; %v", h.Endpoint(), err)
 	}
-	req.Header.Set(xhttp.ContentType, "application/json")
+	if payloadType != "" {
+		req.Header.Set(xhttp.ContentType, payloadType)
+	}
 	req.Header.Set(xhttp.MinIOVersion, xhttp.GlobalMinIOVersion)
 	req.Header.Set(xhttp.MinioDeploymentID, xhttp.GlobalDeploymentID)
 
@@ -271,13 +275,7 @@ func (h *Target) send(ctx context.Context, payload []byte, timeout time.Duration
 	}
 }
 
-func (h *Target) logEntry(ctx context.Context, entry interface{}) {
-	logJSON, err := json.Marshal(&entry)
-	if err != nil {
-		atomic.AddInt64(&h.failedMessages, 1)
-		return
-	}
-
+func (h *Target) logEntry(ctx context.Context, payload []byte, payloadType string) {
 	const maxTries = 3
 	tries := 0
 	for tries < maxTries {
@@ -292,7 +290,7 @@ func (h *Target) logEntry(ctx context.Context, entry interface{}) {
 		}
 		time.Sleep(sleep)
 		tries++
-		err := h.send(ctx, logJSON, webhookCallTimeout)
+		err := h.send(ctx, payload, payloadType, webhookCallTimeout)
 		if err == nil {
 			return
 		}
@@ -305,6 +303,9 @@ func (h *Target) logEntry(ctx context.Context, entry interface{}) {
 }
 
 func (h *Target) startHTTPLogger(ctx context.Context) {
+	atomic.AddInt64(&h.workers, 1)
+	defer atomic.AddInt64(&h.workers, -1)
+
 	h.logChMu.RLock()
 	logCh := h.logCh
 	if logCh != nil {
@@ -313,16 +314,40 @@ func (h *Target) startHTTPLogger(ctx context.Context) {
 		defer h.wg.Done()
 	}
 	h.logChMu.RUnlock()
-
-	defer atomic.AddInt64(&h.workers, -1)
-
 	if logCh == nil {
 		return
 	}
+
+	buf := bytebufferpool.Get()
+	defer bytebufferpool.Put(buf)
+
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
+	enc := json.NewEncoder(buf)
+	batchSize := h.batchSize
+	if batchSize <= 0 {
+		batchSize = 1
+	}
+
+	payloadType := "application/json"
+	if batchSize > 1 {
+		payloadType = ""
+	}
+
+	var nevents int
 	// Send messages until channel is closed.
 	for entry := range logCh {
 		atomic.AddInt64(&h.totalMessages, 1)
-		h.logEntry(ctx, entry)
+		nevents++
+		if err := enc.Encode(&entry); err != nil {
+			atomic.AddInt64(&h.failedMessages, 1)
+			nevents--
+			continue
+		}
+		if (nevents == batchSize || len(logCh) == 0) && buf.Len() > 0 {
+			h.logEntry(ctx, buf.Bytes(), payloadType)
+			buf.Reset()
+			nevents = 0
+		}
 	}
 }
 
@@ -330,9 +355,10 @@ func (h *Target) startHTTPLogger(ctx context.Context) {
 // sends log over http to the specified endpoint
 func New(config Config) *Target {
 	h := &Target{
-		logCh:  make(chan interface{}, config.QueueSize),
-		config: config,
-		status: statusOffline,
+		logCh:     make(chan interface{}, config.QueueSize),
+		config:    config,
+		status:    statusOffline,
+		batchSize: config.BatchSize,
 	}
 
 	// If proxy available, set the same
@@ -364,7 +390,7 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 		atomic.AddInt64(&h.failedMessages, 1)
 		return
 	}
-	if err := h.send(context.Background(), logJSON, webhookCallTimeout); err != nil {
+	if err := h.send(context.Background(), logJSON, "application/json", webhookCallTimeout); err != nil {
 		atomic.AddInt64(&h.failedMessages, 1)
 		if xnet.IsNetworkOrHostDown(err, true) {
 			return store.ErrNotConnected
@@ -379,10 +405,6 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 // Messages are queued in the disk if the store is enabled
 // If Cancel has been called the message is ignored.
 func (h *Target) Send(ctx context.Context, entry interface{}) error {
-	if atomic.LoadInt32(&h.status) == statusOffline {
-		h.config.LogOnce(ctx, fmt.Errorf("target %s is offline", h.Endpoint()), h.Endpoint())
-		return nil
-	}
 	if atomic.LoadInt32(&h.status) == statusClosed {
 		return nil
 	}
@@ -397,8 +419,15 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 		return nil
 	}
 
+	mworkers := maxWorkers
+	if h.batchSize > 100 {
+		mworkers = maxWorkersWithBatchEvents
+	}
+
+retry:
 	select {
 	case h.logCh <- entry:
+		atomic.AddInt64(&h.totalMessages, 1)
 	case <-ctx.Done():
 		// return error only for context timedout.
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -407,20 +436,16 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 		return nil
 	default:
 		nWorkers := atomic.LoadInt64(&h.workers)
-		if nWorkers < maxWorkers {
+		if nWorkers < int64(mworkers) {
 			// Only have one try to start at the same time.
 			h.workerStartMu.Lock()
-			defer h.workerStartMu.Unlock()
-			// Start one max every second.
 			if time.Since(h.lastStarted) > time.Second {
-				if atomic.CompareAndSwapInt64(&h.workers, nWorkers, nWorkers+1) {
-					// Start another logger.
-					h.lastStarted = time.Now()
-					go h.startHTTPLogger(ctx)
-				}
+				h.lastStarted = time.Now()
+				go h.startHTTPLogger(ctx)
 			}
-			h.logCh <- entry
-			return nil
+			h.workerStartMu.Unlock()
+
+			goto retry
 		}
 		atomic.AddInt64(&h.totalMessages, 1)
 		atomic.AddInt64(&h.failedMessages, 1)
@@ -447,7 +472,7 @@ func (h *Target) Cancel() {
 	// and finish the existing ones.
 	// All future ones will be discarded.
 	h.logChMu.Lock()
-	close(h.logCh)
+	xioutil.SafeClose(h.logCh)
 	h.logCh = nil
 	h.logChMu.Unlock()
 

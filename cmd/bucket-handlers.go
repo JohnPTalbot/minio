@@ -51,6 +51,7 @@ import (
 	sse "github.com/minio/minio/internal/bucket/encryption"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
+	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/config/dns"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/event"
@@ -423,7 +424,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		return
 	}
 
-	// Content-Md5 is requied should be set
+	// Content-Md5 is required should be set
 	// http://docs.aws.amazon.com/AmazonS3/latest/API/multiobjectdeleteapi.html
 	if _, ok := r.Header[xhttp.ContentMD5]; !ok {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingContentMD5), r.URL)
@@ -465,13 +466,6 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	// Call checkRequestAuthType to populate ReqInfo.AccessKey before GetBucketInfo()
 	// Ignore errors here to preserve the S3 error behavior of GetBucketInfo()
 	checkRequestAuthType(ctx, r, policy.DeleteObjectAction, bucket, "")
-
-	// Before proceeding validate if bucket exists.
-	_, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
-	if err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
 
 	deleteObjectsFn := objectAPI.DeleteObjects
 
@@ -610,6 +604,12 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		VersionSuspended: vc.Suspended(),
 	})
 
+	// Are all objects saying bucket not found?
+	if isAllBucketsNotFound(errs) {
+		writeErrorResponse(ctx, w, toAPIError(ctx, errs[0]), r.URL)
+		return
+	}
+
 	for i := range errs {
 		// DeleteMarkerVersionID is not used specifically to avoid
 		// lookup errors, since DeleteMarkerVersionID is only
@@ -617,7 +617,7 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		// specify a versionID.
 		objToDel := ObjectToDelete{
 			ObjectV: ObjectV{
-				ObjectName: dObjects[i].ObjectName,
+				ObjectName: decodeDirObject(dObjects[i].ObjectName),
 				VersionID:  dObjects[i].VersionID,
 			},
 			VersionPurgeStatus:            dObjects[i].VersionPurgeStatus(),
@@ -667,6 +667,8 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 		if dobj.ObjectName == "" {
 			continue
 		}
+
+		defer globalCacheConfig.Delete(bucket, dobj.ObjectName)
 
 		if replicateDeletes && (dobj.DeleteMarkerReplicationStatus() == replication.Pending || dobj.VersionPurgeStatus() == Pending) {
 			// copy so we can re-add null ID.
@@ -1192,7 +1194,7 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 	})
 
 	var opts ObjectOptions
-	opts, err = putOpts(ctx, r, bucket, object, metadata)
+	opts, err = putOptsFromReq(ctx, r, bucket, object, metadata)
 	if err != nil {
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
 		return
@@ -1343,6 +1345,22 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 					continue
 				}
 
+				asize, err := objInfo.GetActualSize()
+				if err != nil {
+					asize = objInfo.Size
+				}
+
+				globalCacheConfig.Set(&cache.ObjectInfo{
+					Key:          objInfo.Name,
+					Bucket:       objInfo.Bucket,
+					ETag:         getDecryptedETag(formValues, objInfo, false),
+					ModTime:      objInfo.ModTime,
+					Expires:      objInfo.Expires.UTC().Format(http.TimeFormat),
+					CacheControl: objInfo.CacheControl,
+					Metadata:     cleanReservedKeys(objInfo.UserDefined),
+					Size:         asize,
+				})
+
 				fanOutResp = append(fanOutResp, minio.PutObjectFanOutResponse{
 					Key:          objInfo.Name,
 					ETag:         getDecryptedETag(formValues, objInfo, false),
@@ -1376,7 +1394,7 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 			// Notify object created events.
 			sendEvent(eventArgsList[i])
 
-			if eventArgsList[i].Object.NumVersions > dataScannerExcessiveVersionsThreshold {
+			if eventArgsList[i].Object.NumVersions > int(scannerExcessObjectVersions.Load()) {
 				// Send events for excessive versions.
 				sendEvent(eventArgs{
 					EventName:    event.ObjectManyVersions,
@@ -1386,6 +1404,15 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 					RespElements: extractRespElements(w),
 					UserAgent:    r.UserAgent() + " " + "MinIO-Fan-Out",
 					Host:         handlers.GetSourceIP(r),
+				})
+
+				auditLogInternal(context.Background(), AuditLogOptions{
+					Event:     "scanner:manyversions",
+					APIName:   "PostPolicyBucket",
+					Bucket:    eventArgsList[i].Object.Bucket,
+					Object:    eventArgsList[i].Object.Name,
+					VersionID: eventArgsList[i].Object.VersionID,
+					Status:    http.StatusText(http.StatusOK),
 				})
 			}
 		}
@@ -1399,10 +1426,12 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		return
 	}
 
+	etag := getDecryptedETag(formValues, objInfo, false)
+
 	// We must not use the http.Header().Set method here because some (broken)
 	// clients expect the ETag header key to be literally "ETag" - not "Etag" (case-sensitive).
 	// Therefore, we have to set the ETag directly as map entry.
-	w.Header()[xhttp.ETag] = []string{`"` + objInfo.ETag + `"`}
+	w.Header()[xhttp.ETag] = []string{`"` + etag + `"`}
 
 	// Set the relevant version ID as part of the response header.
 	if objInfo.VersionID != "" && objInfo.VersionID != nullVersionID {
@@ -1412,6 +1441,22 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 	if obj := getObjectLocation(r, globalDomainNames, bucket, object); obj != "" {
 		w.Header().Set(xhttp.Location, obj)
 	}
+
+	asize, err := objInfo.GetActualSize()
+	if err != nil {
+		asize = objInfo.Size
+	}
+
+	defer globalCacheConfig.Set(&cache.ObjectInfo{
+		Key:          objInfo.Name,
+		Bucket:       objInfo.Bucket,
+		ETag:         etag,
+		ModTime:      objInfo.ModTime,
+		Expires:      objInfo.ExpiresStr(),
+		CacheControl: objInfo.CacheControl,
+		Metadata:     cleanReservedKeys(objInfo.UserDefined),
+		Size:         asize,
+	})
 
 	// Notify object created event.
 	defer sendEvent(eventArgs{
@@ -1424,7 +1469,7 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		Host:         handlers.GetSourceIP(r),
 	})
 
-	if objInfo.NumVersions > dataScannerExcessiveVersionsThreshold {
+	if objInfo.NumVersions > int(scannerExcessObjectVersions.Load()) {
 		defer sendEvent(eventArgs{
 			EventName:    event.ObjectManyVersions,
 			BucketName:   objInfo.Bucket,
@@ -1433,6 +1478,15 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 			RespElements: extractRespElements(w),
 			UserAgent:    r.UserAgent(),
 			Host:         handlers.GetSourceIP(r),
+		})
+
+		auditLogInternal(context.Background(), AuditLogOptions{
+			Event:     "scanner:manyversions",
+			APIName:   "PostPolicyBucket",
+			Bucket:    objInfo.Bucket,
+			Object:    objInfo.Name,
+			VersionID: objInfo.VersionID,
+			Status:    http.StatusText(http.StatusOK),
 		})
 	}
 
@@ -1620,9 +1674,11 @@ func (api objectAPIHandlers) DeleteBucketHandler(w http.ResponseWriter, r *http.
 	}
 
 	// Return an error if the bucket does not exist
-	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil && !forceDelete {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
+	if !forceDelete {
+		if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
 	}
 
 	// Attempt to delete bucket.

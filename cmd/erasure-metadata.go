@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,7 +32,6 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/sync/errgroup"
-	"github.com/minio/sio"
 )
 
 // Object was stored with additional erasure codes due to degraded system at upload time
@@ -88,52 +86,6 @@ func (fi FileInfo) IsValid() bool {
 		correctIndexes)
 }
 
-func (fi FileInfo) checkMultipart() (int64, bool) {
-	if len(fi.Parts) == 0 {
-		return 0, false
-	}
-	if !crypto.IsMultiPart(fi.Metadata) {
-		return 0, false
-	}
-	var size int64
-	for _, part := range fi.Parts {
-		psize, err := sio.DecryptedSize(uint64(part.Size))
-		if err != nil {
-			return 0, false
-		}
-		size += int64(psize)
-	}
-
-	return size, len(extractETag(fi.Metadata)) != 32
-}
-
-// GetActualSize - returns the actual size of the stored object
-func (fi FileInfo) GetActualSize() (int64, error) {
-	if _, ok := fi.Metadata[ReservedMetadataPrefix+"compression"]; ok {
-		sizeStr, ok := fi.Metadata[ReservedMetadataPrefix+"actual-size"]
-		if !ok {
-			return -1, errInvalidDecompressedSize
-		}
-		size, err := strconv.ParseInt(sizeStr, 10, 64)
-		if err != nil {
-			return -1, errInvalidDecompressedSize
-		}
-		return size, nil
-	}
-	if _, ok := crypto.IsEncrypted(fi.Metadata); ok {
-		size, ok := fi.checkMultipart()
-		if !ok {
-			size, err := sio.DecryptedSize(uint64(fi.Size))
-			if err != nil {
-				err = errObjectTampered // assign correct error type
-			}
-			return int64(size), err
-		}
-		return size, nil
-	}
-	return fi.Size, nil
-}
-
 // ToObjectInfo - Converts metadata to object info.
 func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInfo {
 	object = decodeDirObject(object)
@@ -158,6 +110,7 @@ func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInf
 		ContentEncoding:  fi.Metadata["content-encoding"],
 		NumVersions:      fi.NumVersions,
 		SuccessorModTime: fi.SuccessorModTime,
+		CacheControl:     fi.Metadata["cache-control"],
 	}
 
 	if exp, ok := fi.Metadata["expires"]; ok {
@@ -165,7 +118,6 @@ func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInf
 			objInfo.Expires = t.UTC()
 		}
 	}
-	objInfo.backendType = BackendErasure
 
 	// Extract etag from metadata.
 	objInfo.ETag = extractETag(fi.Metadata)
@@ -349,17 +301,23 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 				fmt.Fprintf(h, "%v", meta.Erasure.Distribution)
 			}
 
-			// ILM transition fields
-			fmt.Fprint(h, meta.TransitionStatus)
-			fmt.Fprint(h, meta.TransitionTier)
-			fmt.Fprint(h, meta.TransitionedObjName)
-			fmt.Fprint(h, meta.TransitionVersionID)
+			if meta.IsRemote() {
+				// ILM transition fields
+				fmt.Fprint(h, meta.TransitionStatus)
+				fmt.Fprint(h, meta.TransitionTier)
+				fmt.Fprint(h, meta.TransitionedObjName)
+				fmt.Fprint(h, meta.TransitionVersionID)
+			}
 
-			// Server-side replication fields
-			fmt.Fprintf(h, "%v", meta.MarkDeleted)
-			fmt.Fprint(h, meta.Metadata[string(meta.ReplicationState.ReplicaStatus)])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.ReplicationStatusInternal])
-			fmt.Fprint(h, meta.Metadata[meta.ReplicationState.VersionPurgeStatusInternal])
+			// If metadata says encrypted, ask for it in quorum.
+			if etyp, ok := crypto.IsEncrypted(meta.Metadata); ok {
+				fmt.Fprint(h, etyp)
+			}
+
+			// If compressed, look for compressed FileInfo only
+			if meta.IsCompressed() {
+				fmt.Fprint(h, meta.Metadata[ReservedMetadataPrefix+"compression"])
+			}
 
 			metaHashes[i] = hex.EncodeToString(h.Sum(nil))
 			h.Reset()
@@ -423,17 +381,6 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 	return FileInfo{}, errErasureReadQuorum
 }
 
-func pickValidDiskTimeWithQuorum(metaArr []FileInfo, quorum int) time.Time {
-	diskMTimes := listObjectDiskMtimes(metaArr)
-
-	diskMTime, diskMaxima := commonTimeAndOccurence(diskMTimes, shardDiskTimeDelta)
-	if diskMaxima >= quorum {
-		return diskMTime
-	}
-
-	return timeSentinel
-}
-
 // pickValidFileInfo - picks one valid FileInfo content and returns from a
 // slice of FileInfo.
 func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Time, etag string, quorum int) (FileInfo, error) {
@@ -441,7 +388,7 @@ func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Tim
 }
 
 // writeUniqueFileInfo - writes unique `xl.meta` content for each disk concurrently.
-func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
+func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, origbucket, bucket, prefix string, files []FileInfo, quorum int) ([]StorageAPI, error) {
 	g := errgroup.WithNErrs(len(disks))
 
 	// Start writing `xl.meta` to all disks in parallel.
@@ -455,7 +402,7 @@ func writeUniqueFileInfo(ctx context.Context, disks []StorageAPI, bucket, prefix
 			fi := files[index]
 			fi.Erasure.Index = index + 1
 			if fi.IsValid() {
-				return disks[index].WriteMetadata(ctx, bucket, prefix, fi)
+				return disks[index].WriteMetadata(ctx, origbucket, bucket, prefix, fi)
 			}
 			return errCorruptedFormat
 		}, index)
@@ -532,7 +479,7 @@ func listObjectParities(partsMetadata []FileInfo, errs []error) (parities []int)
 // readQuorum is the min required disks to read data.
 // writeQuorum is the min required disks to write data.
 func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []error, defaultParityCount int) (objectReadQuorum, objectWriteQuorum int, err error) {
-	// There should be atleast half correct entries, if not return failure
+	// There should be at least half correct entries, if not return failure
 	expectedRQuorum := len(partsMetaData) / 2
 	if defaultParityCount == 0 {
 		// if parity count is '0', we expected all entries to be present.
@@ -578,6 +525,7 @@ func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []
 const (
 	tierFVID     = "tier-free-versionID"
 	tierFVMarker = "tier-free-marker"
+	tierSkipFVID = "tier-skip-fvid"
 )
 
 // SetTierFreeVersionID sets free-version's versionID. This method is used by
@@ -602,6 +550,23 @@ func (fi *FileInfo) SetTierFreeVersion() {
 		fi.Metadata = make(map[string]string)
 	}
 	fi.Metadata[ReservedMetadataPrefixLower+tierFVMarker] = ""
+}
+
+// SetSkipTierFreeVersion indicates to skip adding a tier free version id.
+// Note: Used only when expiring tiered objects and the remote content has
+// already been scheduled for deletion
+func (fi *FileInfo) SetSkipTierFreeVersion() {
+	if fi.Metadata == nil {
+		fi.Metadata = make(map[string]string)
+	}
+	fi.Metadata[ReservedMetadataPrefixLower+tierSkipFVID] = ""
+}
+
+// SkipTierFreeVersion returns true if set, false otherwise.
+// See SetSkipTierVersion for its purpose.
+func (fi *FileInfo) SkipTierFreeVersion() bool {
+	_, ok := fi.Metadata[ReservedMetadataPrefixLower+tierSkipFVID]
+	return ok
 }
 
 // TierFreeVersion returns true if version is a free-version.

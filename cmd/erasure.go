@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
-	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/dsync"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
@@ -59,19 +58,16 @@ type erasureObjects struct {
 	// getLockers returns list of remote and local lockers.
 	getLockers func() ([]dsync.NetLocker, string)
 
-	// getEndpoints returns list of endpoint strings belonging this set.
+	// getEndpoints returns list of endpoint belonging this set.
 	// some may be local and some remote.
 	getEndpoints func() []Endpoint
 
+	// getEndpoints returns list of endpoint strings belonging this set.
+	// some may be local and some remote.
+	getEndpointStrings func() []string
+
 	// Locker mutex map.
 	nsMutex *nsLockMap
-
-	// Byte pools used for temporary i/o buffers.
-	bp *bpool.BytePoolCap
-
-	// Byte pools used for temporary i/o buffers,
-	// legacy objects.
-	bpOld *bpool.BytePoolCap
 }
 
 // NewNSLock - initialize a new namespace RWLocker instance.
@@ -99,7 +95,7 @@ func diskErrToDriveState(err error) (state string) {
 	switch {
 	case errors.Is(err, errDiskNotFound) || errors.Is(err, context.DeadlineExceeded):
 		state = madmin.DriveStateOffline
-	case errors.Is(err, errCorruptedFormat):
+	case errors.Is(err, errCorruptedFormat) || errors.Is(err, errCorruptedBackend):
 		state = madmin.DriveStateCorrupt
 	case errors.Is(err, errUnformattedDisk):
 		state = madmin.DriveStateUnformatted
@@ -168,7 +164,7 @@ func getOnlineOfflineDisksStats(disksInfo []madmin.Disk) (onlineDisks, offlineDi
 }
 
 // getDisksInfo - fetch disks info across all other storage API.
-func getDisksInfo(disks []StorageAPI, endpoints []Endpoint) (disksInfo []madmin.Disk) {
+func getDisksInfo(disks []StorageAPI, endpoints []Endpoint, metrics bool) (disksInfo []madmin.Disk) {
 	disksInfo = make([]madmin.Disk, len(disks))
 
 	g := errgroup.WithNErrs(len(disks))
@@ -180,13 +176,14 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint) (disksInfo []madmin.
 				PoolIndex: endpoints[index].PoolIdx,
 				SetIndex:  endpoints[index].SetIdx,
 				DiskIndex: endpoints[index].DiskIdx,
+				Local:     endpoints[index].IsLocal,
 			}
 			if disks[index] == OfflineDisk {
 				di.State = diskErrToDriveState(errDiskNotFound)
 				disksInfo[index] = di
 				return nil
 			}
-			info, err := disks[index].DiskInfo(context.TODO(), true)
+			info, err := disks[index].DiskInfo(context.TODO(), DiskInfoOptions{Metrics: metrics})
 			di.DrivePath = info.MountPath
 			di.TotalSpace = info.Total
 			di.UsedSpace = info.Used
@@ -211,6 +208,7 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint) (disksInfo []madmin.
 				APICalls:                make(map[string]uint64, len(info.Metrics.APICalls)),
 				TotalErrorsAvailability: info.Metrics.TotalErrorsAvailability,
 				TotalErrorsTimeout:      info.Metrics.TotalErrorsTimeout,
+				TotalWaiting:            info.Metrics.TotalWaiting,
 			}
 			for k, v := range info.Metrics.LastMinute {
 				if v.N > 0 {
@@ -233,8 +231,8 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint) (disksInfo []madmin.
 }
 
 // Get an aggregated storage info across all disks.
-func getStorageInfo(disks []StorageAPI, endpoints []Endpoint) StorageInfo {
-	disksInfo := getDisksInfo(disks, endpoints)
+func getStorageInfo(disks []StorageAPI, endpoints []Endpoint, metrics bool) StorageInfo {
+	disksInfo := getDisksInfo(disks, endpoints, metrics)
 
 	// Sort so that the first element is the smallest.
 	sort.Slice(disksInfo, func(i, j int) bool {
@@ -253,11 +251,11 @@ func getStorageInfo(disks []StorageAPI, endpoints []Endpoint) StorageInfo {
 func (er erasureObjects) StorageInfo(ctx context.Context) StorageInfo {
 	disks := er.getDisks()
 	endpoints := er.getEndpoints()
-	return getStorageInfo(disks, endpoints)
+	return getStorageInfo(disks, endpoints, true)
 }
 
 // LocalStorageInfo - returns underlying local storage statistics.
-func (er erasureObjects) LocalStorageInfo(ctx context.Context) StorageInfo {
+func (er erasureObjects) LocalStorageInfo(ctx context.Context, metrics bool) StorageInfo {
 	disks := er.getDisks()
 	endpoints := er.getEndpoints()
 
@@ -271,10 +269,15 @@ func (er erasureObjects) LocalStorageInfo(ctx context.Context) StorageInfo {
 		}
 	}
 
-	return getStorageInfo(localDisks, localEndpoints)
+	return getStorageInfo(localDisks, localEndpoints, metrics)
 }
 
-func (er erasureObjects) getOnlineDisksWithHealing() (newDisks []StorageAPI, healing bool) {
+// getOnlineDisksWithHealingAndInfo - returns online disks and overall healing status.
+// Disks are randomly ordered, but in the following groups:
+// - Non-scanning disks
+// - Non-healing disks
+// - Healing disks (if inclHealing is true)
+func (er erasureObjects) getOnlineDisksWithHealingAndInfo(inclHealing bool) (newDisks []StorageAPI, newInfos []DiskInfo, healing bool) {
 	var wg sync.WaitGroup
 	disks := er.getDisks()
 	infos := make([]DiskInfo, len(disks))
@@ -287,48 +290,63 @@ func (er erasureObjects) getOnlineDisksWithHealing() (newDisks []StorageAPI, hea
 
 			disk := disks[i]
 			if disk == nil {
-				infos[i].Error = "offline drive"
+				infos[i].Error = errDiskNotFound.Error()
 				return
 			}
 
-			di, err := disk.DiskInfo(context.Background(), false)
-			if err != nil || di.Healing {
+			di, err := disk.DiskInfo(context.Background(), DiskInfoOptions{})
+			infos[i] = di
+			if err != nil {
 				// - Do not consume disks which are not reachable
 				//   unformatted or simply not accessible for some reason.
-				//
-				//
-				// - Future: skip busy disks
-				if err != nil {
-					infos[i].Error = err.Error()
-				}
-				return
+				infos[i].Error = err.Error()
 			}
-
-			infos[i] = di
 		}()
 	}
 	wg.Wait()
 
-	var scanningDisks []StorageAPI
+	var scanningDisks, healingDisks []StorageAPI
+	var scanningInfos, healingInfos []DiskInfo
+
 	for i, info := range infos {
 		// Check if one of the drives in the set is being healed.
 		// this information is used by scanner to skip healing
 		// this erasure set while it calculates the usage.
-		if info.Healing || info.Error != "" {
-			healing = true
+		if info.Error != "" || disks[i] == nil {
 			continue
 		}
+		if info.Healing {
+			healing = true
+			if inclHealing {
+				healingDisks = append(healingDisks, disks[i])
+				healingInfos = append(healingInfos, infos[i])
+			}
+			continue
+		}
+
 		if !info.Scanning {
 			newDisks = append(newDisks, disks[i])
+			newInfos = append(newInfos, infos[i])
 		} else {
 			scanningDisks = append(scanningDisks, disks[i])
+			scanningInfos = append(scanningInfos, infos[i])
 		}
 	}
 
-	// Prefer new disks over disks which are currently being scanned.
+	// Prefer non-scanning disks over disks which are currently being scanned.
 	newDisks = append(newDisks, scanningDisks...)
+	newInfos = append(newInfos, scanningInfos...)
 
-	return newDisks, healing
+	/// Then add healing disks.
+	newDisks = append(newDisks, healingDisks...)
+	newInfos = append(newInfos, healingInfos...)
+
+	return newDisks, newInfos, healing
+}
+
+func (er erasureObjects) getOnlineDisksWithHealing(inclHealing bool) (newDisks []StorageAPI, healing bool) {
+	newDisks, _, healing = er.getOnlineDisksWithHealingAndInfo(inclHealing)
+	return
 }
 
 // Clean-up previously deleted objects. from .minio.sys/tmp/.trash/
@@ -342,7 +360,7 @@ func (er erasureObjects) cleanupDeletedObjects(ctx context.Context) {
 				defer wg.Done()
 				diskPath := disk.Endpoint().Path
 				readDirFn(pathJoin(diskPath, minioMetaTmpDeletedBucket), func(ddir string, typ os.FileMode) error {
-					w := xioutil.NewDeadlineWorker(diskMaxTimeout)
+					w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 					return w.Run(func() error {
 						wait := deletedCleanupSleeper.Timer(ctx)
 						removeAll(pathJoin(diskPath, minioMetaTmpDeletedBucket, ddir))
@@ -364,7 +382,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 	}
 
 	// Collect disks we can use.
-	disks, healing := er.getOnlineDisksWithHealing()
+	disks, healing := er.getOnlineDisksWithHealing(false)
 	if len(disks) == 0 {
 		logger.LogIf(ctx, errors.New("data-scanner: all drives are offline or being healed, skipping scanner cycle"))
 		return nil
@@ -409,7 +427,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 			bucketCh <- b
 		}
 	}
-	close(bucketCh)
+	xioutil.SafeClose(bucketCh)
 
 	bucketResults := make(chan dataUsageEntryInfo, len(disks))
 
@@ -483,7 +501,6 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				cache.Info.SkipHealing = healing
 				cache.Info.NextCycle = wantCycle
 				if cache.Info.Name != bucket.Name {
-					logger.LogIf(ctx, fmt.Errorf("cache name mismatch: %s != %s", cache.Info.Name, bucket.Name))
 					cache.Info = dataUsageCacheInfo{
 						Name:       bucket.Name,
 						LastUpdate: time.Time{},
@@ -510,7 +527,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				// Calc usage
 				before := cache.Info.LastUpdate
 				var err error
-				cache, err = disk.NSScanner(ctx, cache, updates, healScanMode)
+				cache, err = disk.NSScanner(ctx, cache, updates, healScanMode, nil)
 				if err != nil {
 					if !cache.Info.LastUpdate.IsZero() && cache.Info.LastUpdate.After(before) {
 						logger.LogIf(ctx, cache.save(ctx, er, cacheName))
@@ -546,7 +563,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 		}(i)
 	}
 	wg.Wait()
-	close(bucketResults)
+	xioutil.SafeClose(bucketResults)
 	saverWg.Wait()
 
 	return nil

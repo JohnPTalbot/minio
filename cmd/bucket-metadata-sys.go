@@ -19,8 +19,10 @@ package cmd
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -177,6 +179,40 @@ func (sys *BucketMetadataSys) save(ctx context.Context, meta BucketMetadata) err
 // Delete delete the bucket metadata for the specified bucket.
 // must be used by all callers instead of using Update() with nil configData.
 func (sys *BucketMetadataSys) Delete(ctx context.Context, bucket string, configFile string) (updatedAt time.Time, err error) {
+	if configFile == bucketLifecycleConfig {
+		// Get bucket config from current site
+		meta, e := globalBucketMetadataSys.GetConfigFromDisk(ctx, bucket)
+		if e != nil && !errors.Is(e, errConfigNotFound) {
+			return updatedAt, e
+		}
+		var expiryRuleRemoved bool
+		if len(meta.LifecycleConfigXML) > 0 {
+			var lcCfg lifecycle.Lifecycle
+			if err := xml.Unmarshal(meta.LifecycleConfigXML, &lcCfg); err != nil {
+				return updatedAt, err
+			}
+			// find a single expiry rule set the flag
+			for _, rl := range lcCfg.Rules {
+				if !rl.Expiration.IsNull() || !rl.NoncurrentVersionExpiration.IsNull() {
+					expiryRuleRemoved = true
+					break
+				}
+			}
+		}
+
+		// Form empty ILM details with `ExpiryUpdatedAt` field and save
+		var cfgData []byte
+		if expiryRuleRemoved {
+			var lcCfg lifecycle.Lifecycle
+			currtime := time.Now()
+			lcCfg.ExpiryUpdatedAt = &currtime
+			cfgData, err = xml.Marshal(lcCfg)
+			if err != nil {
+				return updatedAt, err
+			}
+		}
+		return sys.updateAndParse(ctx, bucket, configFile, cfgData, false)
+	}
 	return sys.updateAndParse(ctx, bucket, configFile, nil, false)
 }
 
@@ -267,7 +303,10 @@ func (sys *BucketMetadataSys) GetLifecycleConfig(bucket string) (*lifecycle.Life
 		}
 		return nil, time.Time{}, err
 	}
-	if meta.lifecycleConfig == nil {
+	// there could be just `ExpiryUpdatedAt` field populated as part
+	// of last delete all. Treat this situation as not lifecycle configuration
+	// available
+	if meta.lifecycleConfig == nil || len(meta.lifecycleConfig.Rules) == 0 {
 		return nil, time.Time{}, BucketLifecycleNotFound{Bucket: bucket}
 	}
 	return meta.lifecycleConfig, meta.LifecycleConfigUpdatedAt, nil
@@ -444,11 +483,11 @@ func (sys *BucketMetadataSys) concurrentLoad(ctx context.Context, buckets []Buck
 	for index := range buckets {
 		index := index
 		g.Go(func() error {
-			_, _ = sys.objAPI.HealBucket(ctx, buckets[index].Name, madmin.HealOpts{
-				// Ensure heal opts for bucket metadata be deep healed all the time.
-				ScanMode: madmin.HealDeepScan,
-				Recreate: true,
-			})
+			// Sleep and stagger to avoid blocked CPU and thundering
+			// herd upon start up sequence.
+			time.Sleep(25*time.Millisecond + time.Duration(rand.Int63n(int64(100*time.Millisecond))))
+
+			_, _ = sys.objAPI.HealBucket(ctx, buckets[index].Name, madmin.HealOpts{Recreate: true})
 			meta, err := loadBucketMetadata(ctx, sys.objAPI, buckets[index].Name)
 			if err != nil {
 				return err

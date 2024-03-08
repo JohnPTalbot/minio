@@ -25,22 +25,27 @@ import (
 	"sync"
 	"time"
 
-	"github.com/minio/console/restapi"
+	consoleapi "github.com/minio/console/api"
 	"github.com/minio/dnscache"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/browser"
+	"github.com/minio/minio/internal/grid"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/kms"
 	"go.uber.org/atomic"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/config/callhome"
 	"github.com/minio/minio/internal/config/compress"
 	"github.com/minio/minio/internal/config/dns"
+	"github.com/minio/minio/internal/config/drive"
 	idplugin "github.com/minio/minio/internal/config/identity/plugin"
 	polplugin "github.com/minio/minio/internal/config/policy/plugin"
 	"github.com/minio/minio/internal/config/storageclass"
@@ -52,6 +57,7 @@ import (
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/pkg/v2/certs"
+	"github.com/minio/pkg/v2/env"
 	xnet "github.com/minio/pkg/v2/net"
 )
 
@@ -125,13 +131,54 @@ const (
 	tlsClientSessionCacheSize = 100
 )
 
-var globalCLIContext = struct {
-	JSON, Quiet    bool
-	Anonymous      bool
-	StrictS3Compat bool
-}{}
+func init() {
+	// Injected to prevent circular dependency.
+	pubsub.GetByteBuffer = grid.GetByteBuffer
+}
+
+type poolDisksLayout struct {
+	cmdline string
+	layout  [][]string
+}
+
+type disksLayout struct {
+	legacy bool
+	pools  []poolDisksLayout
+}
+
+type serverCtxt struct {
+	JSON, Quiet               bool
+	Anonymous                 bool
+	StrictS3Compat            bool
+	Addr, ConsoleAddr         string
+	ConfigDir, CertsDir       string
+	configDirSet, certsDirSet bool
+	Interface                 string
+
+	RootUser, RootPwd string
+
+	FTP  []string
+	SFTP []string
+
+	UserTimeout             time.Duration
+	ConnReadDeadline        time.Duration
+	ConnWriteDeadline       time.Duration
+	ConnClientReadDeadline  time.Duration
+	ConnClientWriteDeadline time.Duration
+
+	ShutdownTimeout     time.Duration
+	IdleTimeout         time.Duration
+	ReadHeaderTimeout   time.Duration
+	MaxIdleConnsPerHost int
+
+	// The layout of disks as interpreted
+	Layout disksLayout
+}
 
 var (
+	// Global user opts context
+	globalServerCtxt serverCtxt
+
 	// Indicates if the running minio server is distributed setup.
 	globalIsDistErasure = false
 
@@ -153,6 +200,9 @@ var (
 
 	// Disable redirect, default is enabled.
 	globalBrowserRedirect bool
+
+	// globalBrowserConfig Browser user configurable settings
+	globalBrowserConfig browser.Config
 
 	// This flag is set to 'true' when MINIO_UPDATE env is set to 'off'. Default is false.
 	globalInplaceUpdateDisabled = false
@@ -190,6 +240,7 @@ var (
 	globalBucketMonitor     *bandwidth.Monitor
 	globalPolicySys         *PolicySys
 	globalIAMSys            *IAMSys
+	globalBytePoolCap       *bpool.BytePoolCap
 
 	globalLifecycleSys       *LifecycleSys
 	globalBucketSSEConfigSys *BucketSSEConfigSys
@@ -242,10 +293,16 @@ var (
 	// The global callhome config
 	globalCallhomeConfig callhome.Config
 
+	// The global drive config
+	globalDriveConfig drive.Config
+
+	// The global cache config
+	globalCacheConfig cache.Config
+
 	// Global server's network statistics
 	globalConnStats = newConnStats()
 
-	// Global HTTP request statisitics
+	// Global HTTP request statistics
 	globalHTTPStats = newHTTPStats()
 
 	// Global bucket network and API statistics
@@ -255,7 +312,8 @@ var (
 	// Time when the server is started
 	globalBootTime = UTCNow()
 
-	globalActiveCred auth.Credentials
+	globalActiveCred         auth.Credentials
+	globalSiteReplicatorCred siteReplicatorCred
 
 	// Captures if root credentials are set via ENV.
 	globalCredViaEnv bool
@@ -322,13 +380,15 @@ var (
 		return *ptr
 	}
 
-	globalAllHealState *allHealState
+	globalAllHealState = newHealState(GlobalContext, true)
 
 	// The always present healing routine ready to heal objects
-	globalBackgroundHealRoutine *healRoutine
-	globalBackgroundHealState   *allHealState
+	globalBackgroundHealRoutine = newHealRoutine()
+	globalBackgroundHealState   = newHealState(GlobalContext, false)
 
-	globalMRFState mrfState
+	globalMRFState = mrfState{
+		opCh: make(chan partialOperation, mrfOpsQueueSize),
+	}
 
 	// If writes to FS backend should be O_SYNC.
 	globalFSOSync bool
@@ -341,6 +401,8 @@ var (
 
 	globalRemoteTargetTransport http.RoundTripper
 
+	globalHealthChkTransport http.RoundTripper
+
 	globalDNSCache = &dnscache.Resolver{
 		Timeout: 5 * time.Second,
 	}
@@ -349,9 +411,7 @@ var (
 
 	globalTierConfigMgr *TierConfigMgr
 
-	globalTierJournal *TierJournal
-
-	globalConsoleSrv *restapi.Server
+	globalConsoleSrv *consoleapi.Server
 
 	// handles service freeze or un-freeze S3 API calls.
 	globalServiceFreeze atomic.Value
@@ -361,9 +421,11 @@ var (
 	globalServiceFreezeMu  sync.Mutex // Updates.
 
 	// List of local drives to this node, this is only set during server startup,
-	// and should never be mutated. Hold globalLocalDrivesMu to access.
+	// and is only mutated by HealFormat. Hold globalLocalDrivesMu to access.
 	globalLocalDrives   []StorageAPI
 	globalLocalDrivesMu sync.RWMutex
+
+	globalDriveMonitoring = env.Get("_MINIO_DRIVE_ACTIVE_MONITORING", config.EnableOn) == config.EnableOn
 
 	// Is MINIO_CI_CD set?
 	globalIsCICD bool

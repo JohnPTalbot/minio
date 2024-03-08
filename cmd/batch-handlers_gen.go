@@ -42,12 +42,6 @@ func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err, "Started")
 				return
 			}
-		case "Location":
-			z.Location, err = dc.ReadString()
-			if err != nil {
-				err = msgp.WrapError(err, "Location")
-				return
-			}
 		case "Replicate":
 			if dc.IsNil() {
 				err = dc.ReadNil()
@@ -81,6 +75,24 @@ func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = z.KeyRotate.DecodeMsg(dc)
 				if err != nil {
 					err = msgp.WrapError(err, "KeyRotate")
+					return
+				}
+			}
+		case "Expire":
+			if dc.IsNil() {
+				err = dc.ReadNil()
+				if err != nil {
+					err = msgp.WrapError(err, "Expire")
+					return
+				}
+				z.Expire = nil
+			} else {
+				if z.Expire == nil {
+					z.Expire = new(BatchJobExpire)
+				}
+				err = z.Expire.DecodeMsg(dc)
+				if err != nil {
+					err = msgp.WrapError(err, "Expire")
 					return
 				}
 			}
@@ -128,16 +140,6 @@ func (z *BatchJobRequest) EncodeMsg(en *msgp.Writer) (err error) {
 		err = msgp.WrapError(err, "Started")
 		return
 	}
-	// write "Location"
-	err = en.Append(0xa8, 0x4c, 0x6f, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e)
-	if err != nil {
-		return
-	}
-	err = en.WriteString(z.Location)
-	if err != nil {
-		err = msgp.WrapError(err, "Location")
-		return
-	}
 	// write "Replicate"
 	err = en.Append(0xa9, 0x52, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x65)
 	if err != nil {
@@ -172,6 +174,23 @@ func (z *BatchJobRequest) EncodeMsg(en *msgp.Writer) (err error) {
 			return
 		}
 	}
+	// write "Expire"
+	err = en.Append(0xa6, 0x45, 0x78, 0x70, 0x69, 0x72, 0x65)
+	if err != nil {
+		return
+	}
+	if z.Expire == nil {
+		err = en.WriteNil()
+		if err != nil {
+			return
+		}
+	} else {
+		err = z.Expire.EncodeMsg(en)
+		if err != nil {
+			err = msgp.WrapError(err, "Expire")
+			return
+		}
+	}
 	return
 }
 
@@ -188,9 +207,6 @@ func (z *BatchJobRequest) MarshalMsg(b []byte) (o []byte, err error) {
 	// string "Started"
 	o = append(o, 0xa7, 0x53, 0x74, 0x61, 0x72, 0x74, 0x65, 0x64)
 	o = msgp.AppendTime(o, z.Started)
-	// string "Location"
-	o = append(o, 0xa8, 0x4c, 0x6f, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e)
-	o = msgp.AppendString(o, z.Location)
 	// string "Replicate"
 	o = append(o, 0xa9, 0x52, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x65)
 	if z.Replicate == nil {
@@ -210,6 +226,17 @@ func (z *BatchJobRequest) MarshalMsg(b []byte) (o []byte, err error) {
 		o, err = z.KeyRotate.MarshalMsg(o)
 		if err != nil {
 			err = msgp.WrapError(err, "KeyRotate")
+			return
+		}
+	}
+	// string "Expire"
+	o = append(o, 0xa6, 0x45, 0x78, 0x70, 0x69, 0x72, 0x65)
+	if z.Expire == nil {
+		o = msgp.AppendNil(o)
+	} else {
+		o, err = z.Expire.MarshalMsg(o)
+		if err != nil {
+			err = msgp.WrapError(err, "Expire")
 			return
 		}
 	}
@@ -252,12 +279,6 @@ func (z *BatchJobRequest) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "Started")
 				return
 			}
-		case "Location":
-			z.Location, bts, err = msgp.ReadStringBytes(bts)
-			if err != nil {
-				err = msgp.WrapError(err, "Location")
-				return
-			}
 		case "Replicate":
 			if msgp.IsNil(bts) {
 				bts, err = msgp.ReadNilBytes(bts)
@@ -292,6 +313,23 @@ func (z *BatchJobRequest) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+		case "Expire":
+			if msgp.IsNil(bts) {
+				bts, err = msgp.ReadNilBytes(bts)
+				if err != nil {
+					return
+				}
+				z.Expire = nil
+			} else {
+				if z.Expire == nil {
+					z.Expire = new(BatchJobExpire)
+				}
+				bts, err = z.Expire.UnmarshalMsg(bts)
+				if err != nil {
+					err = msgp.WrapError(err, "Expire")
+					return
+				}
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -306,7 +344,7 @@ func (z *BatchJobRequest) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z *BatchJobRequest) Msgsize() (s int) {
-	s = 1 + 3 + msgp.StringPrefixSize + len(z.ID) + 5 + msgp.StringPrefixSize + len(z.User) + 8 + msgp.TimeSize + 9 + msgp.StringPrefixSize + len(z.Location) + 10
+	s = 1 + 3 + msgp.StringPrefixSize + len(z.ID) + 5 + msgp.StringPrefixSize + len(z.User) + 8 + msgp.TimeSize + 10
 	if z.Replicate == nil {
 		s += msgp.NilSize
 	} else {
@@ -317,6 +355,12 @@ func (z *BatchJobRequest) Msgsize() (s int) {
 		s += msgp.NilSize
 	} else {
 		s += z.KeyRotate.Msgsize()
+	}
+	s += 7
+	if z.Expire == nil {
+		s += msgp.NilSize
+	} else {
+		s += z.Expire.Msgsize()
 	}
 	return
 }

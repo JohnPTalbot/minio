@@ -20,25 +20,29 @@ package cmd
 import (
 	"net/http"
 
+	"github.com/minio/minio/internal/grid"
 	"github.com/minio/mux"
 )
 
 // Composed function registering routers for only distributed Erasure setup.
 func registerDistErasureRouters(router *mux.Router, endpointServerPools EndpointServerPools) {
 	// Register storage REST router only if its a distributed setup.
-	registerStorageRESTHandlers(router, endpointServerPools)
+	registerStorageRESTHandlers(router, endpointServerPools, globalGrid.Load())
 
 	// Register peer REST router only if its a distributed setup.
-	registerPeerRESTHandlers(router)
+	registerPeerRESTHandlers(router, globalGrid.Load())
 
 	// Register peer S3 router only if its a distributed setup.
 	registerPeerS3Handlers(router)
 
 	// Register bootstrap REST router for distributed setups.
-	registerBootstrapRESTHandlers(router)
+	registerBootstrapRESTHandlers(globalGrid.Load())
 
 	// Register distributed namespace lock routers.
-	registerLockRESTHandlers(router)
+	registerLockRESTHandlers()
+
+	// Add grid to router
+	router.Handle(grid.RoutePath, adminMiddleware(globalGrid.Load().Handler(), noGZFlag, noObjLayerFlag))
 }
 
 // List of some generic middlewares which are applied for all incoming requests.

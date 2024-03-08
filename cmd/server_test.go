@@ -137,7 +137,7 @@ func TestServerSuite(t *testing.T) {
 		// Init and run test on ErasureSet backend.
 		{serverType: "ErasureSet", signer: signerV4},
 	}
-	globalCLIContext.StrictS3Compat = true
+	globalServerCtxt.StrictS3Compat = true
 	for i, testCase := range testCases {
 		t.Run(fmt.Sprintf("Test: %d, ServerType: %s", i+1, testCase.serverType), func(t *testing.T) {
 			runAllTests(testCase, &check{t, testCase.serverType})
@@ -1974,8 +1974,8 @@ func (s *TestSuiteCommon) TestGetObjectLarge11MiB(c *check) {
 	c.Assert(putMD5, getMD5)
 }
 
-// TestGetPartialObjectMisAligned - tests get object partially mis-aligned.
-// create a large buffer of mis-aligned data and upload it.
+// TestGetPartialObjectMisAligned - tests get object partially miss-aligned.
+// create a large buffer of miss-aligned data and upload it.
 // then make partial range requests to while fetching it back and assert the response content.
 func (s *TestSuiteCommon) TestGetPartialObjectMisAligned(c *check) {
 	// generate a random bucket name.
