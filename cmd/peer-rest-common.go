@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,8 +18,7 @@
 package cmd
 
 const (
-	peerRESTVersion = "v33" // Add SRMetrics
-
+	peerRESTVersion       = "v38" // Convert RPC calls
 	peerRESTVersionPrefix = SlashSeparator + peerRESTVersion
 	peerRESTPrefix        = minioReservedBucketPath + "/peer"
 	peerRESTPath          = peerRESTPrefix + peerRESTVersionPrefix
@@ -27,60 +26,21 @@ const (
 
 const (
 	peerRESTMethodHealth                      = "/health"
-	peerRESTMethodServerInfo                  = "/serverinfo"
-	peerRESTMethodLocalStorageInfo            = "/localstorageinfo"
-	peerRESTMethodCPUInfo                     = "/cpuinfo"
-	peerRESTMethodDiskHwInfo                  = "/diskhwinfo"
-	peerRESTMethodNetHwInfo                   = "/nethwinfo"
-	peerRESTMethodOsInfo                      = "/osinfo"
-	peerRESTMethodMemInfo                     = "/meminfo"
-	peerRESTMethodProcInfo                    = "/procinfo"
-	peerRESTMethodSysErrors                   = "/syserrors"
-	peerRESTMethodSysServices                 = "/sysservices"
-	peerRESTMethodSysConfig                   = "/sysconfig"
-	peerRESTMethodDeleteBucketMetadata        = "/deletebucketmetadata"
-	peerRESTMethodLoadBucketMetadata          = "/loadbucketmetadata"
-	peerRESTMethodGetBucketStats              = "/getbucketstats"
-	peerRESTMethodGetAllBucketStats           = "/getallbucketstats"
-	peerRESTMethodDownloadBinary              = "/downloadbinary"
+	peerRESTMethodVerifyBinary                = "/verifybinary"
 	peerRESTMethodCommitBinary                = "/commitbinary"
 	peerRESTMethodSignalService               = "/signalservice"
 	peerRESTMethodBackgroundHealStatus        = "/backgroundhealstatus"
 	peerRESTMethodGetLocks                    = "/getlocks"
-	peerRESTMethodLoadUser                    = "/loaduser"
-	peerRESTMethodLoadServiceAccount          = "/loadserviceaccount"
-	peerRESTMethodDeleteUser                  = "/deleteuser"
-	peerRESTMethodDeleteServiceAccount        = "/deleteserviceaccount"
-	peerRESTMethodLoadPolicy                  = "/loadpolicy"
-	peerRESTMethodLoadPolicyMapping           = "/loadpolicymapping"
-	peerRESTMethodDeletePolicy                = "/deletepolicy"
-	peerRESTMethodLoadGroup                   = "/loadgroup"
 	peerRESTMethodStartProfiling              = "/startprofiling"
 	peerRESTMethodDownloadProfilingData       = "/downloadprofilingdata"
-	peerRESTMethodCycleBloom                  = "/cyclebloom"
-	peerRESTMethodTrace                       = "/trace"
-	peerRESTMethodListen                      = "/listen"
-	peerRESTMethodLog                         = "/log"
-	peerRESTMethodGetLocalDiskIDs             = "/getlocaldiskids"
 	peerRESTMethodGetBandwidth                = "/bandwidth"
-	peerRESTMethodGetMetacacheListing         = "/getmetacache"
-	peerRESTMethodUpdateMetacacheListing      = "/updatemetacache"
-	peerRESTMethodGetPeerMetrics              = "/peermetrics"
-	peerRESTMethodGetPeerBucketMetrics        = "/peerbucketmetrics"
-	peerRESTMethodLoadTransitionTierConfig    = "/loadtransitiontierconfig"
 	peerRESTMethodSpeedTest                   = "/speedtest"
 	peerRESTMethodDriveSpeedTest              = "/drivespeedtest"
 	peerRESTMethodReloadSiteReplicationConfig = "/reloadsitereplicationconfig"
-	peerRESTMethodReloadPoolMeta              = "/reloadpoolmeta"
-	peerRESTMethodLoadRebalanceMeta           = "/loadrebalancemeta"
-	peerRESTMethodStopRebalance               = "/stoprebalance"
 	peerRESTMethodGetLastDayTierStats         = "/getlastdaytierstats"
 	peerRESTMethodDevNull                     = "/devnull"
 	peerRESTMethodNetperf                     = "/netperf"
-	peerRESTMethodMetrics                     = "/metrics"
-	peerRESTMethodResourceMetrics             = "/resourcemetrics"
 	peerRESTMethodGetReplicationMRF           = "/getreplicationmrf"
-	peerRESTMethodGetSRMetrics                = "/getsrmetrics"
 )
 
 const (
@@ -100,15 +60,23 @@ const (
 	peerRESTConcurrent     = "concurrent"
 	peerRESTDuration       = "duration"
 	peerRESTStorageClass   = "storage-class"
+	peerRESTEnableSha256   = "enableSha256"
 	peerRESTMetricsTypes   = "types"
 	peerRESTDisk           = "disk"
 	peerRESTHost           = "host"
 	peerRESTJobID          = "job-id"
 	peerRESTDepID          = "depID"
 	peerRESTStartRebalance = "start-rebalance"
+	peerRESTMetrics        = "metrics"
+	peerRESTDryRun         = "dry-run"
+
+	peerRESTURL         = "url"
+	peerRESTSha256Sum   = "sha256sum"
+	peerRESTReleaseInfo = "releaseinfo"
 
 	peerRESTListenBucket = "bucket"
 	peerRESTListenPrefix = "prefix"
 	peerRESTListenSuffix = "suffix"
 	peerRESTListenEvents = "events"
+	peerRESTLogMask      = "log-mask"
 )

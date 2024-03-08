@@ -25,12 +25,14 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 )
@@ -143,6 +145,41 @@ func (iamOS *IAMObjectStore) loadIAMConfig(ctx context.Context, item interface{}
 
 func (iamOS *IAMObjectStore) deleteIAMConfig(ctx context.Context, path string) error {
 	return deleteConfig(ctx, iamOS.objAPI, path)
+}
+
+func (iamOS *IAMObjectStore) loadPolicyDocWithRetry(ctx context.Context, policy string, m map[string]PolicyDoc, retries int) error {
+	for {
+	retry:
+		data, objInfo, err := iamOS.loadIAMConfigBytesWithMetadata(ctx, getPolicyDocPath(policy))
+		if err != nil {
+			if err == errConfigNotFound {
+				return errNoSuchPolicy
+			}
+			retries--
+			if retries <= 0 {
+				return err
+			}
+			time.Sleep(500 * time.Millisecond)
+			goto retry
+		}
+
+		var p PolicyDoc
+		err = p.parseJSON(data)
+		if err != nil {
+			return err
+		}
+
+		if p.Version == 0 {
+			// This means that policy was in the old version (without any
+			// timestamp info). We fetch the mod time of the file and save
+			// that as create and update date.
+			p.CreateDate = objInfo.ModTime
+			p.UpdateDate = objInfo.ModTime
+		}
+
+		m[policy] = p
+		return nil
+	}
 }
 
 func (iamOS *IAMObjectStore) loadPolicyDoc(ctx context.Context, policy string, m map[string]PolicyDoc) error {
@@ -288,6 +325,30 @@ func (iamOS *IAMObjectStore) loadGroups(ctx context.Context, m map[string]GroupI
 	return nil
 }
 
+func (iamOS *IAMObjectStore) loadMappedPolicyWithRetry(ctx context.Context, name string, userType IAMUserType, isGroup bool,
+	m map[string]MappedPolicy, retries int,
+) error {
+	for {
+	retry:
+		var p MappedPolicy
+		err := iamOS.loadIAMConfig(ctx, &p, getMappedPolicyPath(name, userType, isGroup))
+		if err != nil {
+			if err == errConfigNotFound {
+				return errNoSuchPolicy
+			}
+			retries--
+			if retries <= 0 {
+				return err
+			}
+			time.Sleep(500 * time.Millisecond)
+			goto retry
+		}
+
+		m[name] = p
+		return nil
+	}
+}
+
 func (iamOS *IAMObjectStore) loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool,
 	m map[string]MappedPolicy,
 ) error {
@@ -299,6 +360,7 @@ func (iamOS *IAMObjectStore) loadMappedPolicy(ctx context.Context, name string, 
 		}
 		return err
 	}
+
 	m[name] = p
 	return nil
 }
@@ -575,12 +637,12 @@ func listIAMConfigItems(ctx context.Context, objAPI ObjectLayer, pathPrefix stri
 	ch := make(chan itemOrErr)
 
 	go func() {
-		defer close(ch)
+		defer xioutil.SafeClose(ch)
 
 		// Allocate new results channel to receive ObjectInfo.
 		objInfoCh := make(chan ObjectInfo)
 
-		if err := objAPI.Walk(ctx, minioMetaBucket, pathPrefix, objInfoCh, ObjectOptions{}); err != nil {
+		if err := objAPI.Walk(ctx, minioMetaBucket, pathPrefix, objInfoCh, WalkOptions{}); err != nil {
 			select {
 			case ch <- itemOrErr{Err: err}:
 			case <-ctx.Done():

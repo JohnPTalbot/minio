@@ -20,9 +20,7 @@ package cmd
 import (
 	"context"
 	"errors"
-	"fmt"
 	"hash/crc32"
-	"io"
 
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/sync/errgroup"
@@ -64,7 +62,7 @@ func reduceErrs(errs []error, ignoredErrs []error) (maxCount int, maxErr error) 
 		if IsErrIgnored(err, ignoredErrs...) {
 			continue
 		}
-		// Errors due to context cancelation may be wrapped - group them by context.Canceled.
+		// Errors due to context cancellation may be wrapped - group them by context.Canceled.
 		if errors.Is(err, context.Canceled) {
 			errorCounts[context.Canceled]++
 			continue
@@ -150,8 +148,13 @@ func hashOrder(key string, cardinality int) []int {
 
 // Reads all `xl.meta` metadata as a FileInfo slice.
 // Returns error slice indicating the failed metadata reads.
-func readAllFileInfo(ctx context.Context, disks []StorageAPI, bucket, object, versionID string, readData bool) ([]FileInfo, []error) {
+func readAllFileInfo(ctx context.Context, disks []StorageAPI, origbucket string, bucket, object, versionID string, readData, healing bool) ([]FileInfo, []error) {
 	metadataArray := make([]FileInfo, len(disks))
+
+	opts := ReadOptions{
+		ReadData: readData,
+		Healing:  healing,
+	}
 
 	g := errgroup.WithNErrs(len(disks))
 	// Read `xl.meta` in parallel across disks.
@@ -161,33 +164,12 @@ func readAllFileInfo(ctx context.Context, disks []StorageAPI, bucket, object, ve
 			if disks[index] == nil {
 				return errDiskNotFound
 			}
-			metadataArray[index], err = disks[index].ReadVersion(ctx, bucket, object, versionID, readData)
+			metadataArray[index], err = disks[index].ReadVersion(ctx, origbucket, bucket, object, versionID, opts)
 			return err
 		}, index)
 	}
 
-	ignoredErrs := []error{
-		errFileNotFound,
-		errVolumeNotFound,
-		errFileVersionNotFound,
-		io.ErrUnexpectedEOF, // some times we would read without locks, ignore these errors
-		io.EOF,              // some times we would read without locks, ignore these errors
-	}
-	ignoredErrs = append(ignoredErrs, objectOpIgnoredErrs...)
-	errs := g.Wait()
-	for index, err := range errs {
-		if err == nil {
-			continue
-		}
-		if !IsErr(err, ignoredErrs...) {
-			logger.LogOnceIf(ctx, fmt.Errorf("Drive %s, path (%s/%s) returned an error (%w)",
-				disks[index], bucket, object, err),
-				disks[index].String())
-		}
-	}
-
-	// Return all the metadata.
-	return metadataArray, errs
+	return metadataArray, g.Wait()
 }
 
 // shuffleDisksAndPartsMetadataByIndex this function should be always used by GetObjectNInfo()
@@ -326,15 +308,12 @@ var (
 // returns error if totalSize is -1, partSize is 0, partIndex is 0.
 func calculatePartSizeFromIdx(ctx context.Context, totalSize int64, partSize int64, partIndex int) (currPartSize int64, err error) {
 	if totalSize < -1 {
-		logger.LogIf(ctx, errInvalidArgument)
 		return 0, errInvalidArgument
 	}
 	if partSize == 0 {
-		logger.LogIf(ctx, errPartSizeZero)
 		return 0, errPartSizeZero
 	}
 	if partIndex < 1 {
-		logger.LogIf(ctx, errPartSizeIndex)
 		return 0, errPartSizeIndex
 	}
 	if totalSize == -1 {

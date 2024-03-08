@@ -95,6 +95,14 @@ func SetNotifyKafka(s config.Config, name string, cfg target.KafkaArgs) error {
 			Key:   target.KafkaSASLPassword,
 			Value: cfg.SASL.Password,
 		},
+		config.KV{
+			Key:   target.KafkaCompressionCodec,
+			Value: cfg.Producer.Compression,
+		},
+		config.KV{
+			Key:   target.KafkaCompressionLevel,
+			Value: strconv.Itoa(cfg.Producer.CompressionLevel),
+		},
 	}
 	return nil
 }
@@ -437,6 +445,10 @@ func SetNotifyNATS(s config.Config, natsName string, cfg target.NATSArgs) error 
 		config.KV{
 			Key:   target.NATSUsername,
 			Value: cfg.Username,
+		},
+		config.KV{
+			Key:   target.NATSUserCredentials,
+			Value: cfg.UserCredentials,
 		},
 		config.KV{
 			Key:   target.NATSPassword,

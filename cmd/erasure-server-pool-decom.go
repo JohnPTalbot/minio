@@ -26,7 +26,6 @@ import (
 	"math/rand"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -620,11 +619,12 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket stri
 		res, err := z.NewMultipartUpload(ctx, bucket, objInfo.Name, ObjectOptions{
 			VersionID:   objInfo.VersionID,
 			UserDefined: objInfo.UserDefined,
+			NoAuditLog:  true,
 		})
 		if err != nil {
 			return fmt.Errorf("decommissionObject: NewMultipartUpload() %w", err)
 		}
-		defer z.AbortMultipartUpload(ctx, bucket, objInfo.Name, res.UploadID, ObjectOptions{})
+		defer z.AbortMultipartUpload(ctx, bucket, objInfo.Name, res.UploadID, ObjectOptions{NoAuditLog: true})
 		parts := make([]CompletePart, len(objInfo.Parts))
 		for i, part := range objInfo.Parts {
 			hr, err := hash.NewReader(ctx, io.LimitReader(gr, part.Size), part.Size, "", "", part.ActualSize)
@@ -639,6 +639,7 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket stri
 					IndexCB: func() []byte {
 						return part.Index // Preserve part Index to ensure decompression works.
 					},
+					NoAuditLog: true,
 				})
 			if err != nil {
 				return fmt.Errorf("decommissionObject: PutObjectPart() %w", err)
@@ -653,7 +654,9 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket stri
 			}
 		}
 		_, err = z.CompleteMultipartUpload(ctx, bucket, objInfo.Name, res.UploadID, parts, ObjectOptions{
-			MTime: objInfo.ModTime,
+			DataMovement: true,
+			MTime:        objInfo.ModTime,
+			NoAuditLog:   true,
 		})
 		if err != nil {
 			err = fmt.Errorf("decommissionObject: CompleteMultipartUpload() %w", err)
@@ -665,11 +668,13 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket stri
 	if err != nil {
 		return fmt.Errorf("decommissionObject: hash.NewReader() %w", err)
 	}
+
 	_, err = z.PutObject(ctx,
 		bucket,
 		objInfo.Name,
 		NewPutObjReader(hr),
 		ObjectOptions{
+			DataMovement: true,
 			VersionID:    objInfo.VersionID,
 			MTime:        objInfo.ModTime,
 			UserDefined:  objInfo.UserDefined,
@@ -677,6 +682,7 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket stri
 			IndexCB: func() []byte {
 				return objInfo.Parts[0].Index // Preserve part Index to ensure decompression works.
 			},
+			NoAuditLog: true,
 		})
 	if err != nil {
 		err = fmt.Errorf("decommissionObject: PutObject() %w", err)
@@ -696,15 +702,18 @@ func (v versionsSorter) reverse() {
 }
 
 func (set *erasureObjects) listObjectsToDecommission(ctx context.Context, bi decomBucketInfo, fn func(entry metaCacheEntry)) error {
-	disks := set.getOnlineDisks()
+	disks, _ := set.getOnlineDisksWithHealing(false)
 	if len(disks) == 0 {
 		return fmt.Errorf("no online drives found for set with endpoints %s", set.getEndpoints())
 	}
 
+	// However many we ask, versions must exist on ~50%
+	listingQuorum := (set.setDriveCount + 1) / 2
+
 	// How to resolve partial results.
 	resolver := metadataResolutionParams{
-		dirQuorum: len(disks) / 2, // make sure to capture all quorum ratios
-		objQuorum: len(disks) / 2, // make sure to capture all quorum ratios
+		dirQuorum: listingQuorum, // make sure to capture all quorum ratios
+		objQuorum: listingQuorum, // make sure to capture all quorum ratios
 		bucket:    bi.Name,
 	}
 
@@ -714,7 +723,7 @@ func (set *erasureObjects) listObjectsToDecommission(ctx context.Context, bi dec
 		path:           bi.Prefix,
 		recursive:      true,
 		forwardTo:      "",
-		minDisks:       len(disks) / 2, // to capture all quorum ratios
+		minDisks:       listingQuorum,
 		reportNotFound: false,
 		agreed:         fn,
 		partial: func(entries metaCacheEntries, _ []error) {
@@ -731,14 +740,15 @@ func (set *erasureObjects) listObjectsToDecommission(ctx context.Context, bi dec
 func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool *erasureSets, bi decomBucketInfo) error {
 	ctx = logger.SetReqInfo(ctx, &logger.ReqInfo{})
 
-	wStr := env.Get("_MINIO_DECOMMISSION_WORKERS", strconv.Itoa(len(pool.sets)))
-	workerSize, err := strconv.Atoi(wStr)
+	const envDecomWorkers = "_MINIO_DECOMMISSION_WORKERS"
+	workerSize, err := env.GetInt(envDecomWorkers, len(pool.sets))
 	if err != nil {
-		return err
+		logger.LogIf(ctx, fmt.Errorf("invalid workers value err: %v, defaulting to %d", err, len(pool.sets)))
+		workerSize = len(pool.sets)
 	}
 
-	// each set get its own thread separate from the concurrent
-	// objects/versions being decommissioned.
+	// Each decom worker needs one List() goroutine/worker
+	// add that many extra workers.
 	workerSize += len(pool.sets)
 
 	wk, err := workers.New(workerSize)
@@ -767,7 +777,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 
 			evt := evalActionFromLifecycle(ctx, *lc, lr, rcfg, objInfo)
 			switch {
-			case evt.Action.DeleteRestored(): // if restored copy has expired,delete it synchronously
+			case evt.Action.DeleteRestored(): // if restored copy has expired, delete it synchronously
 				applyExpiryOnTransitionedObject(ctx, z, objInfo, evt, lcEventSrc_Decom)
 				return false
 			case evt.Action.Delete():
@@ -834,6 +844,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 							DeleteReplication:  version.ReplicationState,
 							DeleteMarker:       true, // make sure we create a delete marker
 							SkipDecommissioned: true, // make sure we skip the decommissioned pool
+							NoAuditLog:         true,
 						})
 					var failure bool
 					if err != nil {
@@ -853,6 +864,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 						// Success keep a count.
 						decommissioned++
 					}
+					auditLogDecom(ctx, "DecomCopyDeleteMarker", bi.Name, version.Name, versionID, err)
 					continue
 				}
 
@@ -883,6 +895,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 							VersionID:    versionID,
 							NoDecryption: true,
 							NoLock:       true,
+							NoAuditLog:   true,
 						})
 					if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 						// object deleted by the application, nothing to do here we move on.
@@ -934,7 +947,9 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					bi.Name,
 					encodeDirObject(entry.name),
 					ObjectOptions{
-						DeletePrefix: true, // use prefix delete to delete all versions at once.
+						DeletePrefix:       true, // use prefix delete to delete all versions at once.
+						DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
+						NoAuditLog:         true,
 					},
 				)
 				stopFn(err)
@@ -959,6 +974,10 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			// We will perpetually retry listing if it fails, since we cannot
 			// possibly give up in this matter
 			for {
+				if contextCanceled(ctx) {
+					break
+				}
+
 				err := set.listObjectsToDecommission(ctx, bi,
 					func(entry metaCacheEntry) {
 						wk.Take()
@@ -1161,7 +1180,7 @@ func (z *erasureServerPools) doDecommissionInRoutine(ctx context.Context, idx in
 	z.poolMetaMutex.Unlock()
 
 	if !failed {
-		logger.Info("Decommissioning complete for pool '%s', verifying for any pending objects", poolCmdLine)
+		logger.Event(dctx, "Decommissioning complete for pool '%s', verifying for any pending objects", poolCmdLine)
 		err := z.checkAfterDecom(dctx, idx)
 		if err != nil {
 			logger.LogIf(ctx, err)

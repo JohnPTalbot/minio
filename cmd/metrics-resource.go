@@ -27,7 +27,6 @@ import (
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/shirou/gopsutil/v3/host"
 )
 
 const (
@@ -53,6 +52,7 @@ const (
 
 	// memory stats
 	memUsed      MetricName = "used"
+	memUsedPerc  MetricName = "used_perc"
 	memFree      MetricName = "free"
 	memShared    MetricName = "shared"
 	memBuffers   MetricName = "buffers"
@@ -60,15 +60,18 @@ const (
 	memAvailable MetricName = "available"
 
 	// cpu stats
-	cpuUser   MetricName = "user"
-	cpuSystem MetricName = "system"
-	cpuIOWait MetricName = "iowait"
-	cpuIdle   MetricName = "idle"
-	cpuNice   MetricName = "nice"
-	cpuSteal  MetricName = "steal"
-	cpuLoad1  MetricName = "load1"
-	cpuLoad5  MetricName = "load5"
-	cpuLoad15 MetricName = "load15"
+	cpuUser       MetricName = "user"
+	cpuSystem     MetricName = "system"
+	cpuIOWait     MetricName = "iowait"
+	cpuIdle       MetricName = "idle"
+	cpuNice       MetricName = "nice"
+	cpuSteal      MetricName = "steal"
+	cpuLoad1      MetricName = "load1"
+	cpuLoad5      MetricName = "load5"
+	cpuLoad15     MetricName = "load15"
+	cpuLoad1Perc  MetricName = "load1_perc"
+	cpuLoad5Perc  MetricName = "load5_perc"
+	cpuLoad15Perc MetricName = "load15_perc"
 )
 
 var (
@@ -79,6 +82,11 @@ var (
 	// resourceMetricsHelpMap maps metric name to its help string
 	resourceMetricsHelpMap map[MetricName]string
 	resourceMetricsGroups  []*MetricsGroup
+	// initial values for drives (at the time  of server startup)
+	// used for calculating avg values for drive metrics
+	latestDriveStats      map[string]madmin.DiskIOStats
+	latestDriveStatsMu    sync.RWMutex
+	lastDriveStatsRefresh time.Time
 )
 
 // PeerResourceMetrics represents the resource metrics
@@ -126,6 +134,7 @@ func init() {
 		interfaceTxErrors: "Transmit errors in " + interval,
 		total:             "Total memory on the node",
 		memUsed:           "Used memory on the node",
+		memUsedPerc:       "Used memory percentage on the node",
 		memFree:           "Free memory on the node",
 		memShared:         "Shared memory on the node",
 		memBuffers:        "Buffers memory on the node",
@@ -137,7 +146,7 @@ func init() {
 		writesKBPerSec:    "Kilobytes written per second on a drive",
 		readsAwait:        "Average time for read requests to be served on a drive",
 		writesAwait:       "Average time for write requests to be served on a drive",
-		percUtil:          "Percentage of time the disk was busy since uptime",
+		percUtil:          "Percentage of time the disk was busy",
 		usedBytes:         "Used bytes on a drive",
 		totalBytes:        "Total bytes on a drive",
 		usedInodes:        "Total inodes used on a drive",
@@ -151,6 +160,9 @@ func init() {
 		cpuLoad1:          "CPU load average 1min",
 		cpuLoad5:          "CPU load average 5min",
 		cpuLoad15:         "CPU load average 15min",
+		cpuLoad1Perc:      "CPU load average 1min (perentage)",
+		cpuLoad5Perc:      "CPU load average 5min (percentage)",
+		cpuLoad15Perc:     "CPU load average 15min (percentage)",
 	}
 	resourceMetricsGroups = []*MetricsGroup{
 		getResourceMetrics(),
@@ -206,50 +218,69 @@ func updateResourceMetrics(subSys MetricSubsystem, name MetricName, val float64,
 	resourceMetricsMap[subSys] = subsysMetrics
 }
 
-func collectDriveMetrics(m madmin.RealtimeMetrics) {
-	upt, _ := host.Uptime()
-	kib := 1 << 10
+// updateDriveIOStats - Updates the drive IO stats by calculating the difference between the current and latest updated values.
+func updateDriveIOStats(currentStats madmin.DiskIOStats, latestStats madmin.DiskIOStats, labels map[string]string) {
 	sectorSize := uint64(512)
-
-	for d, dm := range m.ByDisk {
-		stats := dm.IOStats
-		labels := map[string]string{"drive": d}
-		updateResourceMetrics(driveSubsystem, readsPerSec, float64(stats.ReadIOs)/float64(upt), labels, false)
-
-		readBytes := stats.ReadSectors * sectorSize
-		readKib := float64(readBytes) / float64(kib)
-		readKibPerSec := readKib / float64(upt)
-		updateResourceMetrics(driveSubsystem, readsKBPerSec, readKibPerSec, labels, false)
-
-		updateResourceMetrics(driveSubsystem, writesPerSec, float64(stats.WriteIOs)/float64(upt), labels, false)
-
-		writeBytes := stats.WriteSectors * sectorSize
-		writeKib := float64(writeBytes) / float64(kib)
-		writeKibPerSec := writeKib / float64(upt)
-		updateResourceMetrics(driveSubsystem, writesKBPerSec, writeKibPerSec, labels, false)
-
-		rdAwait := 0.0
-		if stats.ReadIOs > 0 {
-			rdAwait = float64(stats.ReadTicks) / float64(stats.ReadIOs)
-		}
-		updateResourceMetrics(driveSubsystem, readsAwait, rdAwait, labels, false)
-
-		wrAwait := 0.0
-		if stats.WriteIOs > 0 {
-			wrAwait = float64(stats.WriteTicks) / float64(stats.WriteIOs)
-		}
-		updateResourceMetrics(driveSubsystem, writesAwait, wrAwait, labels, false)
-
-		updateResourceMetrics(driveSubsystem, percUtil, float64(stats.TotalTicks)/float64(upt*10), labels, false)
+	kib := float64(1 << 10)
+	diffInSeconds := time.Now().UTC().Sub(lastDriveStatsRefresh).Seconds()
+	if diffInSeconds == 0 {
+		// too soon to update the stats
+		return
+	}
+	diffStats := madmin.DiskIOStats{
+		ReadIOs:      currentStats.ReadIOs - latestStats.ReadIOs,
+		WriteIOs:     currentStats.WriteIOs - latestStats.WriteIOs,
+		ReadTicks:    currentStats.ReadTicks - latestStats.ReadTicks,
+		WriteTicks:   currentStats.WriteTicks - latestStats.WriteTicks,
+		TotalTicks:   currentStats.TotalTicks - latestStats.TotalTicks,
+		ReadSectors:  currentStats.ReadSectors - latestStats.ReadSectors,
+		WriteSectors: currentStats.WriteSectors - latestStats.WriteSectors,
 	}
 
+	updateResourceMetrics(driveSubsystem, readsPerSec, float64(diffStats.ReadIOs)/diffInSeconds, labels, false)
+	readKib := float64(diffStats.ReadSectors*sectorSize) / kib
+	updateResourceMetrics(driveSubsystem, readsKBPerSec, readKib/diffInSeconds, labels, false)
+
+	updateResourceMetrics(driveSubsystem, writesPerSec, float64(diffStats.WriteIOs)/diffInSeconds, labels, false)
+	writeKib := float64(diffStats.WriteSectors*sectorSize) / kib
+	updateResourceMetrics(driveSubsystem, writesKBPerSec, writeKib/diffInSeconds, labels, false)
+
+	rdAwait := 0.0
+	if diffStats.ReadIOs > 0 {
+		rdAwait = float64(diffStats.ReadTicks) / float64(diffStats.ReadIOs)
+	}
+	updateResourceMetrics(driveSubsystem, readsAwait, rdAwait, labels, false)
+
+	wrAwait := 0.0
+	if diffStats.WriteIOs > 0 {
+		wrAwait = float64(diffStats.WriteTicks) / float64(diffStats.WriteIOs)
+	}
+	updateResourceMetrics(driveSubsystem, writesAwait, wrAwait, labels, false)
+	updateResourceMetrics(driveSubsystem, percUtil, float64(diffStats.TotalTicks)/(diffInSeconds*10), labels, false)
+}
+
+func collectDriveMetrics(m madmin.RealtimeMetrics) {
+	latestDriveStatsMu.Lock()
+	for d, dm := range m.ByDisk {
+		labels := map[string]string{"drive": d}
+		latestStats, ok := latestDriveStats[d]
+		if !ok {
+			latestDriveStats[d] = dm.IOStats
+			continue
+		}
+		updateDriveIOStats(dm.IOStats, latestStats, labels)
+		latestDriveStats[d] = dm.IOStats
+	}
+	lastDriveStatsRefresh = time.Now().UTC()
+	latestDriveStatsMu.Unlock()
+
 	globalLocalDrivesMu.RLock()
-	gld := globalLocalDrives
+	localDrives := cloneDrives(globalLocalDrives)
 	globalLocalDrivesMu.RUnlock()
 
-	for _, d := range gld {
-		labels := map[string]string{"drive": d.Endpoint().RawPath}
-		di, err := d.DiskInfo(GlobalContext, false)
+	for _, d := range localDrives {
+		di, err := d.DiskInfo(GlobalContext, DiskInfoOptions{})
+		labels := map[string]string{"drive": di.Endpoint}
 		if err == nil {
 			updateResourceMetrics(driveSubsystem, usedBytes, float64(di.Used), labels, false)
 			updateResourceMetrics(driveSubsystem, totalBytes, float64(di.Total), labels, false)
@@ -283,6 +314,8 @@ func collectLocalResourceMetrics() {
 				stats := hm.Mem.Info
 				updateResourceMetrics(memSubsystem, total, float64(stats.Total), labels, false)
 				updateResourceMetrics(memSubsystem, memUsed, float64(stats.Used), labels, false)
+				perc := math.Round(float64(stats.Used*100*100)/float64(stats.Total)) / 100
+				updateResourceMetrics(memSubsystem, memUsedPerc, perc, labels, false)
 				updateResourceMetrics(memSubsystem, memFree, float64(stats.Free), labels, false)
 				updateResourceMetrics(memSubsystem, memShared, float64(stats.Shared), labels, false)
 				updateResourceMetrics(memSubsystem, memBuffers, float64(stats.Buffers), labels, false)
@@ -312,6 +345,14 @@ func collectLocalResourceMetrics() {
 					updateResourceMetrics(cpuSubsystem, cpuLoad1, ls.Load1, labels, false)
 					updateResourceMetrics(cpuSubsystem, cpuLoad5, ls.Load5, labels, false)
 					updateResourceMetrics(cpuSubsystem, cpuLoad15, ls.Load15, labels, false)
+					if hm.CPU.CPUCount > 0 {
+						perc := math.Round(ls.Load1*100*100/float64(hm.CPU.CPUCount)) / 100
+						updateResourceMetrics(cpuSubsystem, cpuLoad1Perc, perc, labels, false)
+						perc = math.Round(ls.Load5*100*100/float64(hm.CPU.CPUCount)) / 100
+						updateResourceMetrics(cpuSubsystem, cpuLoad5Perc, perc, labels, false)
+						perc = math.Round(ls.Load15*100*100/float64(hm.CPU.CPUCount)) / 100
+						updateResourceMetrics(cpuSubsystem, cpuLoad15Perc, perc, labels, false)
+					}
 				}
 			}
 			break // only one host expected
@@ -321,8 +362,26 @@ func collectLocalResourceMetrics() {
 	collectDriveMetrics(m)
 }
 
+func initLatestValues() {
+	m := collectLocalMetrics(madmin.MetricsDisk, collectMetricsOpts{
+		hosts: map[string]struct{}{
+			globalLocalNodeName: {},
+		},
+	})
+
+	latestDriveStatsMu.Lock()
+	latestDriveStats = map[string]madmin.DiskIOStats{}
+	for d, dm := range m.ByDisk {
+		latestDriveStats[d] = dm.IOStats
+	}
+	lastDriveStatsRefresh = time.Now().UTC()
+	latestDriveStatsMu.Unlock()
+}
+
 // startResourceMetricsCollection - starts the job for collecting resource metrics
 func startResourceMetricsCollection() {
+	initLatestValues()
+
 	resourceMetricsMapMu.Lock()
 	resourceMetricsMap = map[MetricSubsystem]ResourceMetrics{}
 	resourceMetricsMapMu.Unlock()

@@ -66,6 +66,14 @@ func NewPolicySys() *PolicySys {
 	return &PolicySys{}
 }
 
+func getSTSConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {
+	m := make(map[string][]string)
+	if d := r.Form.Get("DurationSeconds"); d != "" {
+		m["DurationSeconds"] = []string{d}
+	}
+	return m
+}
+
 func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {
 	currTime := UTCNow()
 
@@ -121,7 +129,7 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 		"CurrentTime":      {currTime.Format(time.RFC3339)},
 		"EpochTime":        {strconv.FormatInt(currTime.Unix(), 10)},
 		"SecureTransport":  {strconv.FormatBool(r.TLS != nil)},
-		"SourceIp":         {handlers.GetSourceIP(r)},
+		"SourceIp":         {handlers.GetSourceIPRaw(r)},
 		"UserAgent":        {r.UserAgent()},
 		"Referer":          {r.Referer()},
 		"principaltype":    {principalType},
@@ -137,6 +145,10 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 	}
 
 	cloneHeader := r.Header.Clone()
+	if v := cloneHeader.Get("x-amz-signature-age"); v != "" {
+		args["signatureAge"] = []string{v}
+		cloneHeader.Del("x-amz-signature-age")
+	}
 
 	if userTags := cloneHeader.Get(xhttp.AmzObjectTagging); userTags != "" {
 		tag, _ := tags.ParseObjectTags(userTags)

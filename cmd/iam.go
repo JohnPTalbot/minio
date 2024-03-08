@@ -45,6 +45,7 @@ import (
 	"github.com/minio/minio/internal/config/policy/opa"
 	polplugin "github.com/minio/minio/internal/config/policy/plugin"
 	xhttp "github.com/minio/minio/internal/http"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/v2/policy"
@@ -189,7 +190,7 @@ func (sys *IAMSys) Initialized() bool {
 // Load - loads all credentials, policies and policy mappings.
 func (sys *IAMSys) Load(ctx context.Context, firstTime bool) error {
 	loadStartTime := time.Now()
-	err := sys.store.LoadIAMCache(ctx)
+	err := sys.store.LoadIAMCache(ctx, firstTime)
 	if err != nil {
 		atomic.AddUint64(&sys.TotalRefreshFailures, 1)
 		return err
@@ -200,6 +201,13 @@ func (sys *IAMSys) Load(ctx context.Context, firstTime bool) error {
 	atomic.StoreUint64(&sys.LastRefreshTimeUnixNano, uint64(loadStartTime.Add(loadDuration).UnixNano()))
 	atomic.AddUint64(&sys.TotalRefreshSuccesses, 1)
 
+	if !globalSiteReplicatorCred.IsValid() {
+		sa, _, err := sys.getServiceAccount(ctx, siteReplicatorSvcAcc)
+		if err == nil {
+			globalSiteReplicatorCred.Set(sa.Credentials)
+		}
+	}
+
 	if firstTime {
 		bootstrapTraceMsg(fmt.Sprintf("globalIAMSys.Load(): (duration: %s)", loadDuration))
 	}
@@ -207,7 +215,7 @@ func (sys *IAMSys) Load(ctx context.Context, firstTime bool) error {
 	select {
 	case <-sys.configLoaded:
 	default:
-		close(sys.configLoaded)
+		xioutil.SafeClose(sys.configLoaded)
 	}
 	return nil
 }
@@ -269,16 +277,13 @@ func (sys *IAMSys) Init(ctx context.Context, objAPI ObjectLayer, etcdClient *etc
 	setGlobalAuthZPlugin(polplugin.New(authZPluginCfg))
 
 	sys.Lock()
-	defer sys.Unlock()
-
 	sys.LDAPConfig = ldapConfig
 	sys.OpenIDConfig = openidConfig
 	sys.STSTLSConfig = stsTLSConfig
-
 	sys.iamRefreshInterval = iamRefreshInterval
-
 	// Initialize IAM store
 	sys.initStore(objAPI, etcdClient)
+	sys.Unlock()
 
 	retryCtx, cancel := context.WithCancel(ctx)
 
@@ -528,7 +533,9 @@ func (sys *IAMSys) GetRolePolicy(arnStr string) (arn.ARN, string, error) {
 	return roleArn, rolePolicy, nil
 }
 
-// DeletePolicy - deletes a canned policy from backend or etcd.
+// DeletePolicy - deletes a canned policy from backend. `notifyPeers` is true
+// whenever this is called via the API. It is false when called via a
+// notification from another peer. This is to avoid infinite loops.
 func (sys *IAMSys) DeletePolicy(ctx context.Context, policyName string, notifyPeers bool) error {
 	if !sys.Initialized() {
 		return errServerNotInitialized
@@ -542,7 +549,7 @@ func (sys *IAMSys) DeletePolicy(ctx context.Context, policyName string, notifyPe
 		}
 	}
 
-	err := sys.store.DeletePolicy(ctx, policyName)
+	err := sys.store.DeletePolicy(ctx, policyName, !notifyPeers)
 	if err != nil {
 		return err
 	}
@@ -940,6 +947,13 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 		return auth.Credentials{}, time.Time{}, errInvalidArgument
 	}
 
+	if len(opts.accessKey) > 0 && len(opts.secretKey) == 0 {
+		return auth.Credentials{}, time.Time{}, auth.ErrNoSecretKeyWithAccessKey
+	}
+	if len(opts.secretKey) > 0 && len(opts.accessKey) == 0 {
+		return auth.Credentials{}, time.Time{}, auth.ErrNoAccessKeyWithSecretKey
+	}
+
 	var policyBuf []byte
 	if opts.sessionPolicy != nil {
 		err := opts.sessionPolicy.Validate()
@@ -973,7 +987,7 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 		m[iamPolicyClaimNameSA()] = inheritedPolicyType
 	}
 
-	// Add all the necessary claims for the service accounts.
+	// Add all the necessary claims for the service account.
 	for k, v := range opts.claims {
 		_, ok := m[k]
 		if !ok {
@@ -983,7 +997,7 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 
 	var accessKey, secretKey string
 	var err error
-	if len(opts.accessKey) > 0 {
+	if len(opts.accessKey) > 0 || len(opts.secretKey) > 0 {
 		accessKey, secretKey = opts.accessKey, opts.secretKey
 	} else {
 		accessKey, secretKey, err = auth.GenerateCredentials()
@@ -1041,7 +1055,7 @@ func (sys *IAMSys) UpdateServiceAccount(ctx context.Context, accessKey string, o
 	return updatedAt, nil
 }
 
-// ListServiceAccounts - lists all services accounts associated to a specific user
+// ListServiceAccounts - lists all service accounts associated to a specific user
 func (sys *IAMSys) ListServiceAccounts(ctx context.Context, accessKey string) ([]auth.Credentials, error) {
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
@@ -1055,7 +1069,7 @@ func (sys *IAMSys) ListServiceAccounts(ctx context.Context, accessKey string) ([
 	}
 }
 
-// ListTempAccounts - lists all services accounts associated to a specific user
+// ListTempAccounts - lists all temporary service accounts associated to a specific user
 func (sys *IAMSys) ListTempAccounts(ctx context.Context, accessKey string) ([]UserIdentity, error) {
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
@@ -1064,6 +1078,20 @@ func (sys *IAMSys) ListTempAccounts(ctx context.Context, accessKey string) ([]Us
 	select {
 	case <-sys.configLoaded:
 		return sys.store.ListTempAccounts(ctx, accessKey)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// ListSTSAccounts - lists all STS accounts associated to a specific user
+func (sys *IAMSys) ListSTSAccounts(ctx context.Context, accessKey string) ([]auth.Credentials, error) {
+	if !sys.Initialized() {
+		return nil, errServerNotInitialized
+	}
+
+	select {
+	case <-sys.configLoaded:
+		return sys.store.ListSTSAccounts(ctx, accessKey)
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -1344,9 +1372,15 @@ func (sys *IAMSys) updateGroupMembershipsForLDAP(ctx context.Context) {
 	// DN to ldap username mapping for each LDAP user
 	parentUserToLDAPUsernameMap := make(map[string]string)
 	for _, cred := range allCreds {
+		// Expired credentials don't need parent user updates.
+		if cred.IsExpired() {
+			continue
+		}
+
 		if !sys.LDAPConfig.IsLDAPUserDN(cred.ParentUser) {
 			continue
 		}
+
 		// Check if this is the first time we are
 		// encountering this LDAP user.
 		if _, ok := parentUserToCredsMap[cred.ParentUser]; !ok {
@@ -1367,7 +1401,12 @@ func (sys *IAMSys) updateGroupMembershipsForLDAP(ctx context.Context) {
 					jwtClaims, err = auth.ExtractClaims(cred.SessionToken, globalActiveCred.SecretKey)
 				}
 			} else {
-				jwtClaims, err = auth.ExtractClaims(cred.SessionToken, globalActiveCred.SecretKey)
+				var secretKey string
+				secretKey, err = getTokenSigningKey()
+				if err != nil {
+					continue
+				}
+				jwtClaims, err = auth.ExtractClaims(cred.SessionToken, secretKey)
 			}
 			if err != nil {
 				// skip this cred - session token seems invalid
@@ -1408,6 +1447,11 @@ func (sys *IAMSys) updateGroupMembershipsForLDAP(ctx context.Context) {
 			if gSet.Equals(currGroupsSet) {
 				// No change to groups memberships for this
 				// credential.
+				continue
+			}
+
+			// Expired credentials don't need group membership updates.
+			if cred.IsExpired() {
 				continue
 			}
 
@@ -1720,12 +1764,12 @@ func (sys *IAMSys) PolicyDBUpdateLDAP(ctx context.Context, isAttach bool,
 
 // PolicyDBGet - gets policy set on a user or group. If a list of groups is
 // given, policies associated with them are included as well.
-func (sys *IAMSys) PolicyDBGet(name string, isGroup bool, groups ...string) ([]string, error) {
+func (sys *IAMSys) PolicyDBGet(name string, groups ...string) ([]string, error) {
 	if !sys.Initialized() {
 		return nil, errServerNotInitialized
 	}
 
-	return sys.store.PolicyDBGet(name, isGroup, groups...)
+	return sys.store.PolicyDBGet(name, groups...)
 }
 
 const sessionPolicyNameExtracted = policy.SessionPolicyName + "-extracted"
@@ -1774,7 +1818,7 @@ func (sys *IAMSys) IsAllowedServiceAccount(args policy.Args, parentUser string) 
 
 	default:
 		// Check policy for parent user of service account.
-		svcPolicies, err = sys.PolicyDBGet(parentUser, false, args.Groups...)
+		svcPolicies, err = sys.PolicyDBGet(parentUser, args.Groups...)
 		if err != nil {
 			logger.LogIf(GlobalContext, err)
 			return false
@@ -1822,37 +1866,14 @@ func (sys *IAMSys) IsAllowedServiceAccount(args policy.Args, parentUser string) 
 		return isOwnerDerived || combinedPolicy.IsAllowed(parentArgs)
 	}
 
-	// Now check if we have a sessionPolicy.
-	spolicy, ok := args.Claims[sessionPolicyNameExtracted]
-	if !ok {
-		return false
+	// 3. If an inline session-policy is present, evaluate it.
+	hasSessionPolicy, isAllowedSP := isAllowedBySessionPolicyForServiceAccount(args)
+	if hasSessionPolicy {
+		return isAllowedSP && (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))
 	}
 
-	spolicyStr, ok := spolicy.(string)
-	if !ok {
-		// Sub policy if set, should be a string reject
-		// malformed/malicious requests.
-		return false
-	}
-
-	// Check if policy is parseable.
-	subPolicy, err := policy.ParseConfig(bytes.NewReader([]byte(spolicyStr)))
-	if err != nil {
-		// Log any error in input session policy config.
-		logger.LogIf(GlobalContext, err)
-		return false
-	}
-
-	// This can only happen if policy was set but with an empty JSON.
-	if subPolicy.Version == "" && len(subPolicy.Statements) == 0 {
-		return isOwnerDerived || combinedPolicy.IsAllowed(parentArgs)
-	}
-
-	if subPolicy.Version == "" {
-		return false
-	}
-
-	return subPolicy.IsAllowed(parentArgs) && (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))
+	// Sub policy not set. Evaluate only the parent policies.
+	return (isOwnerDerived || combinedPolicy.IsAllowed(parentArgs))
 }
 
 // IsAllowedSTS is meant for STS based temporary credentials,
@@ -1882,7 +1903,7 @@ func (sys *IAMSys) IsAllowedSTS(args policy.Args, parentUser string) bool {
 	default:
 		// Otherwise, inherit parent user's policy
 		var err error
-		policies, err = sys.store.PolicyDBGet(parentUser, false, args.Groups...)
+		policies, err = sys.store.PolicyDBGet(parentUser, args.Groups...)
 		if err != nil {
 			logger.LogIf(GlobalContext, fmt.Errorf("error fetching policies on %s: %v", parentUser, err))
 			return false
@@ -1942,6 +1963,67 @@ func (sys *IAMSys) IsAllowedSTS(args policy.Args, parentUser string) bool {
 	return isOwnerDerived || combinedPolicy.IsAllowed(args)
 }
 
+func isAllowedBySessionPolicyForServiceAccount(args policy.Args) (hasSessionPolicy bool, isAllowed bool) {
+	hasSessionPolicy = false
+	isAllowed = false
+
+	// Now check if we have a sessionPolicy.
+	spolicy, ok := args.Claims[sessionPolicyNameExtracted]
+	if !ok {
+		return
+	}
+
+	hasSessionPolicy = true
+
+	spolicyStr, ok := spolicy.(string)
+	if !ok {
+		// Sub policy if set, should be a string reject
+		// malformed/malicious requests.
+		return
+	}
+
+	// Check if policy is parseable.
+	subPolicy, err := policy.ParseConfig(bytes.NewReader([]byte(spolicyStr)))
+	if err != nil {
+		// Log any error in input session policy config.
+		logger.LogIf(GlobalContext, err)
+		return
+	}
+
+	// SPECIAL CASE: For service accounts, any valid JSON is allowed as a
+	// policy, regardless of whether the number of statements is 0, this
+	// includes `null`, `{}` and `{"Statement": null}`. In fact, MinIO Console
+	// sends `null` when no policy is set and the intended behavior is that the
+	// service account should inherit parent policy.
+	//
+	// However, for a policy like `{"Statement":[]}`, the intention is to not
+	// provide any permissions via the session policy - i.e. the service account
+	// can do nothing (such a JSON could be generated by an external application
+	// as the policy for the service account). Inheriting the parent policy in
+	// such a case, is a security issue. Ideally, we should not allow such
+	// behavior, but for compatibility with the Console, we currently allow it.
+	//
+	// TODO:
+	//
+	// 1. fix console behavior and allow this inheritance for service accounts
+	// created before a certain (TBD) future date.
+	//
+	// 2. do not allow empty statement policies for service accounts.
+	if subPolicy.Version == "" && subPolicy.Statements == nil && subPolicy.ID == "" {
+		hasSessionPolicy = false
+		return
+	}
+
+	// As the session policy exists, even if the parent is the root account, it
+	// must be restricted by it. So, we set `.IsOwner` to false here
+	// unconditionally.
+	sessionPolicyArgs := args
+	sessionPolicyArgs.IsOwner = false
+
+	// Sub policy is set and valid.
+	return hasSessionPolicy, subPolicy.IsAllowed(sessionPolicyArgs)
+}
+
 func isAllowedBySessionPolicy(args policy.Args) (hasSessionPolicy bool, isAllowed bool) {
 	hasSessionPolicy = false
 	isAllowed = false
@@ -1974,14 +2056,27 @@ func isAllowedBySessionPolicy(args policy.Args) (hasSessionPolicy bool, isAllowe
 		return
 	}
 
+	// As the session policy exists, even if the parent is the root account, it
+	// must be restricted by it. So, we set `.IsOwner` to false here
+	// unconditionally.
+	sessionPolicyArgs := args
+	sessionPolicyArgs.IsOwner = false
+
 	// Sub policy is set and valid.
-	return hasSessionPolicy, subPolicy.IsAllowed(args)
+	return hasSessionPolicy, subPolicy.IsAllowed(sessionPolicyArgs)
 }
 
 // GetCombinedPolicy returns a combined policy combining all policies
 func (sys *IAMSys) GetCombinedPolicy(policies ...string) policy.Policy {
 	_, policy := sys.store.FilterPolicies(strings.Join(policies, ","), "")
 	return policy
+}
+
+// doesPolicyAllow - checks if the given policy allows the passed action with given args. This is rarely needed.
+// Notice there is no account name involved, so this is a dangerous function.
+func (sys *IAMSys) doesPolicyAllow(policy string, args policy.Args) bool {
+	// Policies were found, evaluate all of them.
+	return sys.GetCombinedPolicy(policy).IsAllowed(args)
 }
 
 // IsAllowed - checks given policy args is allowed to continue the Rest API.
@@ -2019,7 +2114,7 @@ func (sys *IAMSys) IsAllowed(args policy.Args) bool {
 	}
 
 	// Continue with the assumption of a regular user
-	policies, err := sys.PolicyDBGet(args.AccountName, false, args.Groups...)
+	policies, err := sys.PolicyDBGet(args.AccountName, args.Groups...)
 	if err != nil {
 		return false
 	}

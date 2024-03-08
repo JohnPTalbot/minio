@@ -190,7 +190,7 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 // collects http metrics for MinIO server in Prometheus specific format
 // and sends to given channel
 func httpMetricsPrometheus(ch chan<- prometheus.Metric) {
-	httpStats := globalHTTPStats.toServerHTTPStats()
+	httpStats := globalHTTPStats.toServerHTTPStats(true)
 
 	for api, value := range httpStats.CurrentS3Requests.APIStats {
 		ch <- prometheus.MustNewConstMetric(
@@ -381,7 +381,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 
 	server := getLocalServerProperty(globalEndpoints, &http.Request{
 		Host: globalLocalNodeName,
-	})
+	}, true)
 
 	onlineDisks, offlineDisks := getOnlineOfflineDisksStats(server.Disks)
 	totalDisks := offlineDisks.Merge(onlineDisks)
@@ -406,7 +406,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		float64(GetTotalCapacityFree(server.Disks)),
 	)
 
-	sinfo := objLayer.StorageInfo(GlobalContext)
+	sinfo := objLayer.StorageInfo(GlobalContext, true)
 
 	// Report total usable capacity
 	ch <- prometheus.MustNewConstMetric(

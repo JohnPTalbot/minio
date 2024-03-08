@@ -18,24 +18,34 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
+	"github.com/minio/kms-go/kes"
+	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/config/browser"
+	"github.com/minio/minio/internal/kms"
+
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/api"
+	"github.com/minio/minio/internal/config/batch"
+	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/config/callhome"
 	"github.com/minio/minio/internal/config/compress"
 	"github.com/minio/minio/internal/config/dns"
+	"github.com/minio/minio/internal/config/drive"
 	"github.com/minio/minio/internal/config/etcd"
 	"github.com/minio/minio/internal/config/heal"
 	xldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
 	idplugin "github.com/minio/minio/internal/config/identity/plugin"
 	xtls "github.com/minio/minio/internal/config/identity/tls"
+	"github.com/minio/minio/internal/config/ilm"
 	"github.com/minio/minio/internal/config/lambda"
 	"github.com/minio/minio/internal/config/notify"
 	"github.com/minio/minio/internal/config/policy/opa"
@@ -68,6 +78,11 @@ func initHelp() {
 		config.ScannerSubSys:        scanner.DefaultKVS,
 		config.SubnetSubSys:         subnet.DefaultKVS,
 		config.CallhomeSubSys:       callhome.DefaultKVS,
+		config.DriveSubSys:          drive.DefaultKVS,
+		config.ILMSubSys:            ilm.DefaultKVS,
+		config.CacheSubSys:          cache.DefaultKVS,
+		config.BatchSubSys:          batch.DefaultKVS,
+		config.BrowserSubSys:        browser.DefaultKVS,
 	}
 	for k, v := range notify.DefaultNotificationKVS {
 		kvs[k] = v
@@ -96,6 +111,10 @@ func initHelp() {
 			Optional:    true,
 		},
 		config.HelpKV{
+			Key:         config.DriveSubSys,
+			Description: "enable drive specific settings",
+		},
+		config.HelpKV{
 			Key:         config.SiteSubSys,
 			Description: "label the server and its location",
 		},
@@ -106,6 +125,10 @@ func initHelp() {
 		config.HelpKV{
 			Key:         config.ScannerSubSys,
 			Description: "manage namespace scanning for usage calculation, lifecycle, healing and more",
+		},
+		config.HelpKV{
+			Key:         config.BatchSubSys,
+			Description: "manage batch job workers and wait times",
 		},
 		config.HelpKV{
 			Key:         config.CompressionSubSys,
@@ -206,6 +229,17 @@ func initHelp() {
 			Key:         config.EtcdSubSys,
 			Description: "persist IAM assets externally to etcd",
 		},
+		config.HelpKV{
+			Key:         config.CacheSubSys,
+			Type:        "string",
+			Description: "enable cache plugin on MinIO for GET/HEAD requests",
+			Optional:    true,
+		},
+		config.HelpKV{
+			Key:         config.BrowserSubSys,
+			Description: "manage Browser HTTP specific features, such as Security headers, etc.",
+			Optional:    true,
+		},
 	}
 
 	if globalIsErasure {
@@ -227,6 +261,7 @@ func initHelp() {
 		config.EtcdSubSys:           etcd.Help,
 		config.CompressionSubSys:    compress.Help,
 		config.HealSubSys:           heal.Help,
+		config.BatchSubSys:          batch.Help,
 		config.ScannerSubSys:        scanner.Help,
 		config.IdentityOpenIDSubSys: openid.Help,
 		config.IdentityLDAPSubSys:   xldap.Help,
@@ -250,6 +285,9 @@ func initHelp() {
 		config.LambdaWebhookSubSys:  lambda.HelpWebhook,
 		config.SubnetSubSys:         subnet.HelpSubnet,
 		config.CallhomeSubSys:       callhome.HelpCallhome,
+		config.DriveSubSys:          drive.HelpDrive,
+		config.CacheSubSys:          cache.Help,
+		config.BrowserSubSys:        browser.Help,
 	}
 
 	config.RegisterHelpSubSys(helpMap)
@@ -283,6 +321,10 @@ func validateSubSysConfig(ctx context.Context, s config.Config, subSys string, o
 		}
 	case config.APISubSys:
 		if _, err := api.LookupConfig(s[config.APISubSys][config.Default]); err != nil {
+			return err
+		}
+	case config.BatchSubSys:
+		if _, err := batch.LookupConfig(s[config.BatchSubSys][config.Default]); err != nil {
 			return err
 		}
 	case config.StorageClassSubSys:
@@ -357,6 +399,14 @@ func validateSubSysConfig(ctx context.Context, s config.Config, subSys string, o
 		if cfg.Enabled() && !globalSubnetConfig.Registered() {
 			return errors.New("Deployment is not registered with SUBNET. Please register the deployment via 'mc license register ALIAS'")
 		}
+	case config.DriveSubSys:
+		if _, err := drive.LookupConfig(s[config.DriveSubSys][config.Default]); err != nil {
+			return err
+		}
+	case config.CacheSubSys:
+		if _, err := cache.LookupConfig(s[config.CacheSubSys][config.Default], globalRemoteTargetTransport); err != nil {
+			return err
+		}
 	case config.PolicyOPASubSys:
 		// In case legacy OPA config is being set, we treat it as if the
 		// AuthZPlugin is being set.
@@ -371,6 +421,10 @@ func validateSubSysConfig(ctx context.Context, s config.Config, subSys string, o
 				NewHTTPTransport(), xhttp.DrainBody); err != nil {
 				return err
 			}
+		}
+	case config.BrowserSubSys:
+		if _, err := browser.LookupConfig(s[config.BrowserSubSys][config.Default]); err != nil {
+			return err
 		}
 	default:
 		if config.LoggerSubSystems.Contains(subSys) {
@@ -451,7 +505,7 @@ func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 
 		if len(globalDomainNames) != 0 && !globalDomainIPs.IsEmpty() && globalEtcdClient != nil {
 			if globalDNSConfig != nil {
-				// if global DNS is already configured, indicate with a warning, incase
+				// if global DNS is already configured, indicate with a warning, in case
 				// users are confused.
 				logger.LogIf(ctx, fmt.Errorf("DNS store is already configured with %s, etcd is not used for DNS store", globalDNSConfig))
 			} else {
@@ -521,6 +575,7 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 		}
 
 		globalAPIConfig.init(apiConfig, setDriveCounts)
+		autoGenerateRootCredentials() // Generate the KMS root credentials here since we don't know whether API root access is disabled until now.
 
 		// Initialize remote instance transport once.
 		getRemoteInstanceTransportOnce.Do(func() {
@@ -540,13 +595,22 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 			return fmt.Errorf("Unable to apply heal config: %w", err)
 		}
 		globalHealConfig.Update(healCfg)
+	case config.BatchSubSys:
+		batchCfg, err := batch.LookupConfig(s[config.BatchSubSys][config.Default])
+		if err != nil {
+			return fmt.Errorf("Unable to apply batch config: %w", err)
+		}
+		globalBatchConfig.Update(batchCfg)
 	case config.ScannerSubSys:
 		scannerCfg, err := scanner.LookupConfig(s[config.ScannerSubSys][config.Default])
 		if err != nil {
 			return fmt.Errorf("Unable to apply scanner config: %w", err)
 		}
 		// update dynamic scanner values.
+		scannerIdleMode.Store(scannerCfg.IdleMode)
 		scannerCycle.Store(scannerCfg.Cycle)
+		scannerExcessObjectVersions.Store(scannerCfg.ExcessVersions)
+		scannerExcessFolders.Store(scannerCfg.ExcessFolders)
 		logger.LogIf(ctx, scannerSleeper.Update(scannerCfg.Delay, scannerCfg.MaxWait))
 	case config.LoggerWebhookSubSys:
 		loggerCfg, err := logger.LookupConfigForSubSys(ctx, s, config.LoggerWebhookSubSys)
@@ -618,7 +682,7 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 		if err != nil {
 			logger.LogIf(ctx, fmt.Errorf("Unable to parse subnet configuration: %w", err))
 		} else {
-			globalSubnetConfig.Update(subnetConfig)
+			globalSubnetConfig.Update(subnetConfig, globalIsCICD)
 			globalSubnetConfig.ApplyEnv() // update environment settings for Console UI
 		}
 	case config.CallhomeSubSys:
@@ -632,6 +696,40 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 				initCallhome(ctx, objAPI)
 			}
 		}
+	case config.DriveSubSys:
+		if driveConfig, err := drive.LookupConfig(s[config.DriveSubSys][config.Default]); err != nil {
+			logger.LogIf(ctx, fmt.Errorf("Unable to load drive config: %w", err))
+		} else {
+			err := globalDriveConfig.Update(driveConfig)
+			if err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to update drive config: %v", err))
+			}
+		}
+	case config.CacheSubSys:
+		cacheCfg, err := cache.LookupConfig(s[config.CacheSubSys][config.Default], globalRemoteTargetTransport)
+		if err != nil {
+			logger.LogIf(ctx, fmt.Errorf("Unable to load cache config: %w", err))
+		} else {
+			globalCacheConfig.Update(cacheCfg)
+		}
+	case config.BrowserSubSys:
+		browserCfg, err := browser.LookupConfig(s[config.BrowserSubSys][config.Default])
+		if err != nil {
+			return fmt.Errorf("Unable to apply browser config: %w", err)
+		}
+		globalBrowserConfig.Update(browserCfg)
+	case config.ILMSubSys:
+		ilmCfg, err := ilm.LookupConfig(s[config.ILMSubSys][config.Default])
+		if err != nil {
+			return fmt.Errorf("Unable to apply ilm config: %w", err)
+		}
+		if globalTransitionState != nil {
+			globalTransitionState.UpdateWorkers(ilmCfg.TransitionWorkers)
+		}
+		if globalExpiryState != nil {
+			globalExpiryState.ResizeWorkers(ilmCfg.ExpirationWorkers)
+		}
+		globalILMConfig.update(ilmCfg)
 	}
 	globalServerConfigMu.Lock()
 	defer globalServerConfigMu.Unlock()
@@ -639,6 +737,55 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 		globalServerConfig[subSys] = s[subSys]
 	}
 	return nil
+}
+
+// autoGenerateRootCredentials generates root credentials deterministically if
+// a KMS is configured, no manual credentials have been specified and if root
+// access is disabled.
+func autoGenerateRootCredentials() {
+	if GlobalKMS == nil {
+		return
+	}
+	if globalAPIConfig.permitRootAccess() || !globalActiveCred.Equal(auth.DefaultCredentials) {
+		return
+	}
+
+	if manager, ok := GlobalKMS.(kms.KeyManager); ok {
+		stat, err := GlobalKMS.Stat(GlobalContext)
+		if err != nil {
+			logger.LogIf(GlobalContext, err, "Unable to generate root credentials using KMS")
+			return
+		}
+
+		aKey, err := manager.HMAC(GlobalContext, stat.DefaultKey, []byte("root access key"))
+		if errors.Is(err, kes.ErrNotAllowed) {
+			return // If we don't have permission to compute the HMAC, don't change the cred.
+		}
+		if err != nil {
+			logger.Fatal(err, "Unable to generate root access key using KMS")
+		}
+
+		sKey, err := manager.HMAC(GlobalContext, stat.DefaultKey, []byte("root secret key"))
+		if err != nil {
+			// Here, we must have permission. Otherwise, we would have failed earlier.
+			logger.Fatal(err, "Unable to generate root secret key using KMS")
+		}
+
+		accessKey, err := auth.GenerateAccessKey(20, bytes.NewReader(aKey))
+		if err != nil {
+			logger.Fatal(err, "Unable to generate root access key")
+		}
+		secretKey, err := auth.GenerateSecretKey(32, bytes.NewReader(sKey))
+		if err != nil {
+			logger.Fatal(err, "Unable to generate root secret key")
+		}
+
+		logger.Info("Automatically generated root access key and secret key with the KMS")
+		globalActiveCred = auth.Credentials{
+			AccessKey: accessKey,
+			SecretKey: secretKey,
+		}
+	}
 }
 
 // applyDynamicConfig will apply dynamic config values.

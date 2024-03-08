@@ -19,12 +19,12 @@ package api
 
 import "github.com/minio/minio/internal/config"
 
-// Help template for storageclass feature.
 var (
 	defaultHelpPostfix = func(key string) string {
 		return config.DefaultHelpPostfix(DefaultKVS, key)
 	}
 
+	// Help holds configuration keys and their default values for api subsystem.
 	Help = config.HelpKVS{
 		config.HelpKV{
 			Key:         apiRequestsMax,
@@ -58,7 +58,7 @@ var (
 		},
 		config.HelpKV{
 			Key:         apiListQuorum,
-			Description: `set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict"` + defaultHelpPostfix(apiListQuorum),
+			Description: `set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict", "auto"` + defaultHelpPostfix(apiListQuorum),
 			Optional:    true,
 			Type:        "string",
 		},
@@ -67,6 +67,12 @@ var (
 			Description: `set replication priority` + defaultHelpPostfix(apiReplicationPriority),
 			Optional:    true,
 			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         apiReplicationMaxWorkers,
+			Description: `set the maximum number of replication workers` + defaultHelpPostfix(apiReplicationMaxWorkers),
+			Optional:    true,
+			Type:        "number",
 		},
 		config.HelpKV{
 			Key:         apiTransitionWorkers,

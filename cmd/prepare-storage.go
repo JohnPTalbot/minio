@@ -154,7 +154,7 @@ func isServerResolvable(endpoint Endpoint, timeout time.Duration) error {
 // connect to list of endpoints and load all Erasure disk formats, validate the formats are correct
 // and are in quorum, if no formats are found attempt to initialize all of them for the first
 // time. additionally make sure to close all the disks used in this attempt.
-func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpoints, poolCount, setCount, setDriveCount int, deploymentID, distributionAlgo string) (storageDisks []StorageAPI, format *formatErasureV3, err error) {
+func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpoints, poolCount, setCount, setDriveCount int, deploymentID string) (storageDisks []StorageAPI, format *formatErasureV3, err error) {
 	// Initialize all storage disks
 	storageDisks, errs := initStorageDisksWithErrors(endpoints, storageOpts{cleanUp: true, healthCheck: true})
 
@@ -188,6 +188,7 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpo
 
 	// Attempt to load all `format.json` from all disks.
 	formatConfigs, sErrs := loadFormatErasureAll(storageDisks, false)
+
 	// Check if we have
 	for i, sErr := range sErrs {
 		// print the error, nonetheless, which is perhaps unhandled
@@ -207,20 +208,13 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpo
 		return nil, nil, err
 	}
 
-	// Return error when quorum unformatted disks - indicating we are
-	// waiting for first server to be online.
-	unformattedDisks := quorumUnformattedDisks(sErrs)
-	if unformattedDisks && !firstDisk {
-		return nil, nil, errNotFirstDisk
-	}
-
 	// All disks report unformatted we should initialized everyone.
-	if unformattedDisks && firstDisk {
+	if shouldInitErasureDisks(sErrs) && firstDisk {
 		logger.Info("Formatting %s pool, %v set(s), %v drives per set.",
 			humanize.Ordinal(poolCount), setCount, setDriveCount)
 
 		// Initialize erasure code format on disks
-		format, err = initFormatErasure(GlobalContext, storageDisks, setCount, setDriveCount, deploymentID, distributionAlgo, sErrs)
+		format, err = initFormatErasure(GlobalContext, storageDisks, setCount, setDriveCount, deploymentID, sErrs)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -231,22 +225,17 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpo
 		return storageDisks, format, nil
 	}
 
-	// Mark all root disks down
-	markRootDisksAsDown(storageDisks, sErrs)
-
-	// Following function is added to fix a regressions which was introduced
-	// in release RELEASE.2018-03-16T22-52-12Z after migrating v1 to v2 to v3.
-	// This migration failed to capture '.This' field properly which indicates
-	// the disk UUID association. Below function is called to handle and fix
-	// this regression, for more info refer https://github.com/minio/minio/issues/5667
-	if err = fixFormatErasureV3(storageDisks, endpoints, formatConfigs); err != nil {
-		logger.LogIf(GlobalContext, err)
-		return nil, nil, err
+	// Return error when quorum unformatted disks - indicating we are
+	// waiting for first server to be online.
+	unformattedDisks := quorumUnformattedDisks(sErrs)
+	if unformattedDisks && !firstDisk {
+		return nil, nil, errNotFirstDisk
 	}
 
-	// If any of the .This field is still empty, we return error.
-	if formatErasureV3ThisEmpty(formatConfigs) {
-		return nil, nil, errErasureV3ThisEmpty
+	// Return error when quorum unformatted disks but waiting for rest
+	// of the servers to be online.
+	if unformattedDisks && firstDisk {
+		return nil, nil, errFirstDiskWait
 	}
 
 	format, err = getFormatErasureInQuorum(formatConfigs)
@@ -260,7 +249,7 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpo
 		if !firstDisk {
 			return nil, nil, errNotFirstDisk
 		}
-		if err = formatErasureFixDeploymentID(endpoints, storageDisks, format); err != nil {
+		if err = formatErasureFixDeploymentID(endpoints, storageDisks, format, formatConfigs); err != nil {
 			logger.LogIf(GlobalContext, err)
 			return nil, nil, err
 		}
@@ -277,7 +266,7 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpo
 }
 
 // Format disks before initialization of object layer.
-func waitForFormatErasure(firstDisk bool, endpoints Endpoints, poolCount, setCount, setDriveCount int, deploymentID, distributionAlgo string) ([]StorageAPI, *formatErasureV3, error) {
+func waitForFormatErasure(firstDisk bool, endpoints Endpoints, poolCount, setCount, setDriveCount int, deploymentID string) ([]StorageAPI, *formatErasureV3, error) {
 	if len(endpoints) == 0 || setCount == 0 || setDriveCount == 0 {
 		return nil, nil, errInvalidArgument
 	}
@@ -289,9 +278,12 @@ func waitForFormatErasure(firstDisk bool, endpoints Endpoints, poolCount, setCou
 		return time.Now().Round(time.Second).Sub(formatStartTime).String()
 	}
 
-	var tries int
-	var verboseLogging bool
-	storageDisks, format, err := connectLoadInitFormats(verboseLogging, firstDisk, endpoints, poolCount, setCount, setDriveCount, deploymentID, distributionAlgo)
+	var (
+		tries   int
+		verbose bool
+	)
+
+	storageDisks, format, err := connectLoadInitFormats(verbose, firstDisk, endpoints, poolCount, setCount, setDriveCount, deploymentID)
 	if err == nil {
 		return storageDisks, format, nil
 	}
@@ -304,12 +296,12 @@ func waitForFormatErasure(firstDisk bool, endpoints Endpoints, poolCount, setCou
 
 	for {
 		// Only log once every 10 iterations, then reset the tries count.
-		verboseLogging = tries >= 10
-		if verboseLogging {
+		verbose = tries >= 10
+		if verbose {
 			tries = 1
 		}
 
-		storageDisks, format, err := connectLoadInitFormats(verboseLogging, firstDisk, endpoints, poolCount, setCount, setDriveCount, deploymentID, distributionAlgo)
+		storageDisks, format, err := connectLoadInitFormats(verbose, firstDisk, endpoints, poolCount, setCount, setDriveCount, deploymentID)
 		if err == nil {
 			return storageDisks, format, nil
 		}

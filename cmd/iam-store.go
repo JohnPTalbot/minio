@@ -441,12 +441,14 @@ type IAMStorageAPI interface {
 	runlock()
 	getUsersSysType() UsersSysType
 	loadPolicyDoc(ctx context.Context, policy string, m map[string]PolicyDoc) error
+	loadPolicyDocWithRetry(ctx context.Context, policy string, m map[string]PolicyDoc, retries int) error
 	loadPolicyDocs(ctx context.Context, m map[string]PolicyDoc) error
 	loadUser(ctx context.Context, user string, userType IAMUserType, m map[string]UserIdentity) error
 	loadUsers(ctx context.Context, userType IAMUserType, m map[string]UserIdentity) error
 	loadGroup(ctx context.Context, group string, m map[string]GroupInfo) error
 	loadGroups(ctx context.Context, m map[string]GroupInfo) error
 	loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error
+	loadMappedPolicyWithRetry(ctx context.Context, name string, userType IAMUserType, isGroup bool, m map[string]MappedPolicy, retries int) error
 	loadMappedPolicies(ctx context.Context, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error
 	saveIAMConfig(ctx context.Context, item interface{}, path string, opts ...options) error
 	loadIAMConfig(ctx context.Context, item interface{}, path string) error
@@ -488,7 +490,12 @@ func (store *IAMStoreSys) PurgeExpiredSTS(ctx context.Context) error {
 
 // LoadIAMCache reads all IAM items and populates a new iamCache object and
 // replaces the in-memory cache object.
-func (store *IAMStoreSys) LoadIAMCache(ctx context.Context) error {
+func (store *IAMStoreSys) LoadIAMCache(ctx context.Context, firstTime bool) error {
+	bootstrapTraceMsg := func(s string) {
+		if firstTime {
+			bootstrapTraceMsg(s)
+		}
+	}
 	bootstrapTraceMsg("loading IAM data")
 
 	newCache := newIamCache()
@@ -655,7 +662,7 @@ func (store *IAMStoreSys) GroupNotificationHandler(ctx context.Context, group st
 
 // PolicyDBGet - fetches policies associated with the given user or group, and
 // additional groups if provided.
-func (store *IAMStoreSys) PolicyDBGet(name string, isGroup bool, groups ...string) ([]string, error) {
+func (store *IAMStoreSys) PolicyDBGet(name string, groups ...string) ([]string, error) {
 	if name == "" {
 		return nil, errInvalidArgument
 	}
@@ -663,19 +670,17 @@ func (store *IAMStoreSys) PolicyDBGet(name string, isGroup bool, groups ...strin
 	cache := store.rlock()
 	defer store.runlock()
 
-	policies, _, err := cache.policyDBGet(store, name, isGroup)
+	policies, _, err := cache.policyDBGet(store, name, false)
 	if err != nil {
 		return nil, err
 	}
 
-	if !isGroup {
-		for _, group := range groups {
-			ps, _, err := cache.policyDBGet(store, group, true)
-			if err != nil {
-				return nil, err
-			}
-			policies = append(policies, ps...)
+	for _, group := range groups {
+		ps, _, err := cache.policyDBGet(store, group, true)
+		if err != nil {
+			return nil, err
 		}
+		policies = append(policies, ps...)
 	}
 
 	return policies, nil
@@ -1014,18 +1019,37 @@ func (store *IAMStoreSys) PolicyDBUpdate(ctx context.Context, name string, isGro
 	newPolicyMapping.UpdatedAt = UTCNow()
 	addedOrRemoved = policiesToUpdate.ToSlice()
 
-	if err = store.saveMappedPolicy(ctx, name, userType, isGroup, newPolicyMapping); err != nil {
-		return
-	}
-	if !isGroup {
-		if userType == stsUser {
-			cache.iamSTSPolicyMap[name] = newPolicyMapping
+	// In case of detach operation, it is possible that no policies are mapped -
+	// in this case, we delete the mapping from the store.
+	if len(newPolicies) == 0 {
+		if err = store.deleteMappedPolicy(ctx, name, userType, isGroup); err != nil && !errors.Is(err, errNoSuchPolicy) {
+			return
+		}
+		if !isGroup {
+			if userType == stsUser {
+				delete(cache.iamSTSPolicyMap, name)
+			} else {
+				delete(cache.iamUserPolicyMap, name)
+			}
 		} else {
-			cache.iamUserPolicyMap[name] = newPolicyMapping
+			delete(cache.iamGroupPolicyMap, name)
 		}
 	} else {
-		cache.iamGroupPolicyMap[name] = newPolicyMapping
+
+		if err = store.saveMappedPolicy(ctx, name, userType, isGroup, newPolicyMapping); err != nil {
+			return
+		}
+		if !isGroup {
+			if userType == stsUser {
+				cache.iamSTSPolicyMap[name] = newPolicyMapping
+			} else {
+				cache.iamUserPolicyMap[name] = newPolicyMapping
+			}
+		} else {
+			cache.iamGroupPolicyMap[name] = newPolicyMapping
+		}
 	}
+
 	cache.updatedAt = UTCNow()
 	return cache.updatedAt, addedOrRemoved, newPolicies, nil
 }
@@ -1144,8 +1168,11 @@ func (store *IAMStoreSys) PolicyNotificationHandler(ctx context.Context, policy 
 	return err
 }
 
-// DeletePolicy - deletes policy from storage and cache.
-func (store *IAMStoreSys) DeletePolicy(ctx context.Context, policy string) error {
+// DeletePolicy - deletes policy from storage and cache. When this called in
+// response to a notification (i.e. isFromNotification = true), it skips the
+// validation of policy usage and the attempt to delete in the backend as well
+// (as this is already done by the notifying node).
+func (store *IAMStoreSys) DeletePolicy(ctx context.Context, policy string, isFromNotification bool) error {
 	if policy == "" {
 		return errInvalidArgument
 	}
@@ -1153,42 +1180,44 @@ func (store *IAMStoreSys) DeletePolicy(ctx context.Context, policy string) error
 	cache := store.lock()
 	defer store.unlock()
 
-	// Check if policy is mapped to any existing user or group. If so, we do not
-	// allow deletion of the policy. If the policy is mapped to an STS account,
-	// we do allow deletion.
-	users := []string{}
-	groups := []string{}
-	for u, mp := range cache.iamUserPolicyMap {
-		pset := mp.policySet()
-		if store.getUsersSysType() == MinIOUsersSysType {
-			if _, ok := cache.iamUsersMap[u]; !ok {
-				// This case can happen when a temporary account is
-				// deleted or expired - remove it from userPolicyMap.
-				delete(cache.iamUserPolicyMap, u)
-				continue
+	if !isFromNotification {
+		// Check if policy is mapped to any existing user or group. If so, we do not
+		// allow deletion of the policy. If the policy is mapped to an STS account,
+		// we do allow deletion.
+		users := []string{}
+		groups := []string{}
+		for u, mp := range cache.iamUserPolicyMap {
+			pset := mp.policySet()
+			if store.getUsersSysType() == MinIOUsersSysType {
+				if _, ok := cache.iamUsersMap[u]; !ok {
+					// This case can happen when a temporary account is
+					// deleted or expired - remove it from userPolicyMap.
+					delete(cache.iamUserPolicyMap, u)
+					continue
+				}
+			}
+			if pset.Contains(policy) {
+				users = append(users, u)
 			}
 		}
-		if pset.Contains(policy) {
-			users = append(users, u)
+		for g, mp := range cache.iamGroupPolicyMap {
+			pset := mp.policySet()
+			if pset.Contains(policy) {
+				groups = append(groups, g)
+			}
 		}
-	}
-	for g, mp := range cache.iamGroupPolicyMap {
-		pset := mp.policySet()
-		if pset.Contains(policy) {
-			groups = append(groups, g)
+		if len(users) != 0 || len(groups) != 0 {
+			return errPolicyInUse
 		}
-	}
-	if len(users) != 0 || len(groups) != 0 {
-		return errPolicyInUse
-	}
 
-	err := store.deletePolicyDoc(ctx, policy)
-	if errors.Is(err, errNoSuchPolicy) {
-		// Ignore error if policy is already deleted.
-		err = nil
-	}
-	if err != nil {
-		return err
+		err := store.deletePolicyDoc(ctx, policy)
+		if errors.Is(err, errNoSuchPolicy) {
+			// Ignore error if policy is already deleted.
+			err = nil
+		}
+		if err != nil {
+			return err
+		}
 	}
 
 	delete(cache.iamPolicyDocsMap, policy)
@@ -1218,6 +1247,9 @@ func (store *IAMStoreSys) GetPolicy(name string) (policy.Policy, error) {
 			return v.Policy, errNoSuchPolicy
 		}
 		toMerge = append(toMerge, v.Policy)
+	}
+	if len(toMerge) == 0 {
+		return policy.Policy{}, errNoSuchPolicy
 	}
 	return policy.MergePolicies(toMerge...), nil
 }
@@ -1833,7 +1865,12 @@ func (store *IAMStoreSys) GetAllParentUsers() map[string]ParentUserInfo {
 		if cred.IsServiceAccount() {
 			claims, err = getClaimsFromTokenWithSecret(cred.SessionToken, cred.SecretKey)
 		} else if cred.IsTemp() {
-			claims, err = getClaimsFromTokenWithSecret(cred.SessionToken, globalActiveCred.SecretKey)
+			var secretKey string
+			secretKey, err = getTokenSigningKey()
+			if err != nil {
+				continue
+			}
+			claims, err = getClaimsFromTokenWithSecret(cred.SessionToken, secretKey)
 		}
 
 		if err != nil {
@@ -2313,6 +2350,27 @@ func (store *IAMStoreSys) ListServiceAccounts(ctx context.Context, accessKey str
 	return serviceAccounts, nil
 }
 
+// ListSTSAccounts - lists only STS accounts from the cache.
+func (store *IAMStoreSys) ListSTSAccounts(ctx context.Context, accessKey string) ([]auth.Credentials, error) {
+	cache := store.rlock()
+	defer store.runlock()
+
+	var stsAccounts []auth.Credentials
+	for _, u := range cache.iamSTSAccountsMap {
+		v := u.Credentials
+		if accessKey != "" && v.ParentUser == accessKey {
+			if v.IsTemp() {
+				// Hide secret key & session key here
+				v.SecretKey = ""
+				v.SessionToken = ""
+				stsAccounts = append(stsAccounts, v)
+			}
+		}
+	}
+
+	return stsAccounts, nil
+}
+
 // AddUser - adds/updates long term user account to storage.
 func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, ureq madmin.AddOrUpdateUserReq) (updatedAt time.Time, err error) {
 	cache := store.lock()
@@ -2378,17 +2436,11 @@ func (store *IAMStoreSys) GetSTSAndServiceAccounts() []auth.Credentials {
 	var res []auth.Credentials
 	for _, u := range cache.iamUsersMap {
 		cred := u.Credentials
-		if cred.IsTemp() {
-			panic("unexpected STS credential found in iamUsersMap")
-		}
 		if cred.IsServiceAccount() {
 			res = append(res, cred)
 		}
 	}
 	for _, u := range cache.iamSTSAccountsMap {
-		if !u.Credentials.IsTemp() {
-			panic("unexpected non STS credential found in iamSTSAccountsMap")
-		}
 		res = append(res, u.Credentials)
 	}
 
@@ -2432,22 +2484,24 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) {
 		store.loadUser(ctx, accessKey, regUser, cache.iamUsersMap)
 		if _, found = cache.iamUsersMap[accessKey]; found {
 			// load mapped policies
-			store.loadMappedPolicy(ctx, accessKey, regUser, false, cache.iamUserPolicyMap)
+			store.loadMappedPolicyWithRetry(ctx, accessKey, regUser, false, cache.iamUserPolicyMap, 3)
 		}
 	}
 
 	// Check for service account
 	if !found {
 		store.loadUser(ctx, accessKey, svcUser, cache.iamUsersMap)
-		if svc, found := cache.iamUsersMap[accessKey]; found {
+		var svc UserIdentity
+		svc, found = cache.iamUsersMap[accessKey]
+		if found {
 			// Load parent user and mapped policies.
 			if store.getUsersSysType() == MinIOUsersSysType {
 				store.loadUser(ctx, svc.Credentials.ParentUser, regUser, cache.iamUsersMap)
-				store.loadMappedPolicy(ctx, svc.Credentials.ParentUser, regUser, false, cache.iamUserPolicyMap)
+				store.loadMappedPolicyWithRetry(ctx, svc.Credentials.ParentUser, regUser, false, cache.iamUserPolicyMap, 3)
 			} else {
 				// In case of LDAP the parent user's policy mapping needs to be
 				// loaded into sts map
-				store.loadMappedPolicy(ctx, svc.Credentials.ParentUser, stsUser, false, cache.iamSTSPolicyMap)
+				store.loadMappedPolicyWithRetry(ctx, svc.Credentials.ParentUser, stsUser, false, cache.iamSTSPolicyMap, 3)
 			}
 		}
 	}
@@ -2459,7 +2513,7 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) {
 		store.loadUser(ctx, accessKey, stsUser, cache.iamSTSAccountsMap)
 		if stsUserCred, found = cache.iamSTSAccountsMap[accessKey]; found {
 			// Load mapped policy
-			store.loadMappedPolicy(ctx, stsUserCred.Credentials.ParentUser, stsUser, false, cache.iamSTSPolicyMap)
+			store.loadMappedPolicyWithRetry(ctx, stsUserCred.Credentials.ParentUser, stsUser, false, cache.iamSTSPolicyMap, 3)
 			stsAccountFound = true
 		}
 	}
@@ -2468,13 +2522,13 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) {
 	if !stsAccountFound {
 		for _, policy := range cache.iamUserPolicyMap[accessKey].toSlice() {
 			if _, found = cache.iamPolicyDocsMap[policy]; !found {
-				store.loadPolicyDoc(ctx, policy, cache.iamPolicyDocsMap)
+				store.loadPolicyDocWithRetry(ctx, policy, cache.iamPolicyDocsMap, 3)
 			}
 		}
 	} else {
 		for _, policy := range cache.iamSTSPolicyMap[stsUserCred.Credentials.AccessKey].toSlice() {
 			if _, found = cache.iamPolicyDocsMap[policy]; !found {
-				store.loadPolicyDoc(ctx, policy, cache.iamPolicyDocsMap)
+				store.loadPolicyDocWithRetry(ctx, policy, cache.iamPolicyDocsMap, 3)
 			}
 		}
 	}
@@ -2483,8 +2537,12 @@ func (store *IAMStoreSys) LoadUser(ctx context.Context, accessKey string) {
 func extractJWTClaims(u UserIdentity) (*jwt.MapClaims, error) {
 	jwtClaims, err := auth.ExtractClaims(u.Credentials.SessionToken, u.Credentials.SecretKey)
 	if err != nil {
-		// Session tokens for STS creds will be generated with root secret
-		jwtClaims, err = auth.ExtractClaims(u.Credentials.SessionToken, globalActiveCred.SecretKey)
+		secretKey, err := getTokenSigningKey()
+		if err != nil {
+			return nil, err
+		}
+		// Session tokens for STS creds will be generated with root secret or site-replicator-0 secret
+		jwtClaims, err = auth.ExtractClaims(u.Credentials.SessionToken, secretKey)
 		if err != nil {
 			return nil, err
 		}

@@ -6,10 +6,13 @@ exit_1() {
 
 	echo "minio1 ============"
 	cat /tmp/minio1_1.log
+	cat /tmp/minio1_2.log
 	echo "minio2 ============"
 	cat /tmp/minio2_1.log
+	cat /tmp/minio2_2.log
 	echo "minio3 ============"
 	cat /tmp/minio3_1.log
+	cat /tmp/minio3_2.log
 
 	exit 1
 }
@@ -41,12 +44,20 @@ if [ ! -f ./mc ]; then
 		chmod +x mc
 fi
 
-minio server --config-dir /tmp/minio-internal --address ":9001" /tmp/minio-internal-idp1/{1...4} >/tmp/minio1_1.log 2>&1 &
-site1_pid=$!
-minio server --config-dir /tmp/minio-internal --address ":9002" /tmp/minio-internal-idp2/{1...4} >/tmp/minio2_1.log 2>&1 &
-site2_pid=$!
-minio server --config-dir /tmp/minio-internal --address ":9003" /tmp/minio-internal-idp3/{1...4} >/tmp/minio3_1.log 2>&1 &
-site3_pid=$!
+minio server --config-dir /tmp/minio-internal --address ":9001" http://localhost:9001/tmp/minio-internal-idp1/{1...4} http://localhost:9010/tmp/minio-internal-idp1/{5...8} >/tmp/minio1_1.log 2>&1 &
+site1_pid1=$!
+minio server --config-dir /tmp/minio-internal --address ":9010" http://localhost:9001/tmp/minio-internal-idp1/{1...4} http://localhost:9010/tmp/minio-internal-idp1/{5...8} >/tmp/minio1_2.log 2>&1 &
+site1_pid2=$!
+
+minio server --config-dir /tmp/minio-internal --address ":9002" http://localhost:9002/tmp/minio-internal-idp2/{1...4} http://localhost:9020/tmp/minio-internal-idp2/{5...8} >/tmp/minio2_1.log 2>&1 &
+site2_pid1=$!
+minio server --config-dir /tmp/minio-internal --address ":9020" http://localhost:9002/tmp/minio-internal-idp2/{1...4} http://localhost:9020/tmp/minio-internal-idp2/{5...8} >/tmp/minio2_2.log 2>&1 &
+site2_pid2=$!
+
+minio server --config-dir /tmp/minio-internal --address ":9003" http://localhost:9003/tmp/minio-internal-idp3/{1...4} http://localhost:9030/tmp/minio-internal-idp3/{5...8} >/tmp/minio3_1.log 2>&1 &
+site3_pid1=$!
+minio server --config-dir /tmp/minio-internal --address ":9030" http://localhost:9003/tmp/minio-internal-idp3/{1...4} http://localhost:9030/tmp/minio-internal-idp3/{5...8} >/tmp/minio3_2.log 2>&1 &
+site3_pid2=$!
 
 sleep 10
 
@@ -54,7 +65,24 @@ export MC_HOST_minio1=http://minio:minio123@localhost:9001
 export MC_HOST_minio2=http://minio:minio123@localhost:9002
 export MC_HOST_minio3=http://minio:minio123@localhost:9003
 
+export MC_HOST_minio10=http://minio:minio123@localhost:9010
+export MC_HOST_minio20=http://minio:minio123@localhost:9020
+export MC_HOST_minio30=http://minio:minio123@localhost:9030
+
 ./mc admin replicate add minio1 minio2
+
+site_enabled=$(./mc admin replicate info minio1)
+site_enabled_peer=$(./mc admin replicate info minio10)
+
+[[ $site_enabled =~ "is not enabled" ]] && {
+	echo "expected both peers to have same information"
+	exit_1
+}
+
+[[ $site_enabled_peer =~ "is not enabled" ]] && {
+	echo "expected both peers to have same information"
+	exit_1
+}
 
 ./mc admin user add minio1 foobar foo12345
 
@@ -136,7 +164,20 @@ if [ $? -ne 0 ]; then
 	exit_1
 fi
 
+./mc admin user svcacct add minio2 minio --access-key testsvc2 --secret-key testsvc123
+if [ $? -ne 0 ]; then
+	echo "adding root svc account testsvc2 failed, exiting.."
+	exit_1
+fi
+
 sleep 10
+
+export MC_HOST_rootsvc=http://testsvc2:testsvc123@localhost:9002
+./mc ls rootsvc
+if [ $? -ne 0 ]; then
+	echo "root service account not inherited root permissions, exiting.."
+	exit_1
+fi
 
 ./mc admin user svcacct info minio1 testsvc
 if [ $? -ne 0 ]; then
@@ -229,6 +270,19 @@ if [ "${expected_checksum}" != "${actual_checksum}" ]; then
 fi
 rm ./lrgfile
 
+./mc rm -r --versions --force minio1/newbucket/lrgfile
+if [ $? -ne 0 ]; then
+	echo "expected object to be present, exiting.."
+	exit_1
+fi
+
+sleep 5
+./mc stat minio1/newbucket/lrgfile
+if [ $? -eq 0 ]; then
+	echo "expected object to be deleted permanently after replication, exiting.."
+	exit_1
+fi
+
 vID=$(./mc stat minio2/newbucket/README.md --json | jq .versionID)
 if [ $? -ne 0 ]; then
 	echo "expecting object to be present. exiting.."
@@ -240,7 +294,11 @@ if [ $? -ne 0 ]; then
 	exit_1
 fi
 sleep 5
-
+val=$(./mc tag list minio1/newbucket/README.md --version-id "${vID}" --json | jq -r .tagset.key)
+if [ "${val}" != "val" ]; then
+	echo "expected bucket tag to have replicated, exiting..."
+	exit_1
+fi
 ./mc tag remove --version-id "${vID}" minio2/newbucket/README.md
 if [ $? -ne 0 ]; then
 	echo "expecting tag removal to be successful. exiting.."
@@ -344,7 +402,8 @@ if [ "${policy}" != "null" ]; then
 	exit_1
 fi
 
-kill -9 ${site1_pid}
+kill -9 ${site1_pid1} ${site1_pid2}
+
 # Update tag on minio2/newbucket when minio1 is down
 ./mc tag set minio2/newbucket "key=val2"
 # create a new bucket on minio2. This should replicate to minio1 after it comes online.
@@ -354,7 +413,8 @@ kill -9 ${site1_pid}
 ./mc rb minio2/bucket2
 
 # Restart minio1 instance
-minio server --config-dir /tmp/minio-internal --address ":9001" /tmp/minio-internal-idp1/{1...4} >/tmp/minio1_1.log 2>&1 &
+minio server --config-dir /tmp/minio-internal --address ":9001" http://localhost:9001/tmp/minio-internal-idp1/{1...4} http://localhost:9010/tmp/minio-internal-idp1/{5...8} >/tmp/minio1_1.log 2>&1 &
+minio server --config-dir /tmp/minio-internal --address ":9010" http://localhost:9001/tmp/minio-internal-idp1/{1...4} http://localhost:9010/tmp/minio-internal-idp1/{5...8} >/tmp/minio1_2.log 2>&1 &
 sleep 200
 
 # Test whether most recent tag update on minio2 is replicated to minio1

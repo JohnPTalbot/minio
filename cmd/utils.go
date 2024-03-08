@@ -103,10 +103,10 @@ func ErrorRespToObjectError(err error, params ...string) error {
 	if len(params) >= 1 {
 		bucket = params[0]
 	}
-	if len(params) == 2 {
+	if len(params) >= 2 {
 		object = params[1]
 	}
-	if len(params) == 3 {
+	if len(params) >= 3 {
 		versionID = params[2]
 	}
 
@@ -122,6 +122,10 @@ func ErrorRespToObjectError(err error, params ...string) error {
 	}
 
 	switch minioErr.Code {
+	case "SlowDownWrite":
+		err = InsufficientWriteQuorum{Bucket: bucket, Object: object}
+	case "SlowDownRead":
+		err = InsufficientReadQuorum{Bucket: bucket, Object: object}
 	case "PreconditionFailed":
 		err = PreConditionFailed{}
 	case "InvalidRange":
@@ -288,7 +292,7 @@ func isMaxPartID(partID int) bool {
 	return partID > globalMaxPartID
 }
 
-// profilerWrapper is created becauses pkg/profiler doesn't
+// profilerWrapper is created because pkg/profiler doesn't
 // provide any API to calculate the profiler file path in the
 // disk since the name of this latter is randomly generated.
 type profilerWrapper struct {
@@ -583,7 +587,7 @@ func GetDefaultConnSettings() xhttp.ConnSettings {
 
 // NewInternodeHTTPTransport returns a transport for internode MinIO
 // connections.
-func NewInternodeHTTPTransport() func() http.RoundTripper {
+func NewInternodeHTTPTransport(maxIdleConnsPerHost int) func() http.RoundTripper {
 	lookupHost := globalDNSCache.LookupHost
 	if IsKubernetes() || IsDocker() {
 		lookupHost = nil
@@ -597,7 +601,7 @@ func NewInternodeHTTPTransport() func() http.RoundTripper {
 		CurvePreferences: fips.TLSCurveIDs(),
 		EnableHTTP2:      false,
 		TCPOptions:       globalTCPOptions,
-	}.NewInternodeHTTPTransport()
+	}.NewInternodeHTTPTransport(maxIdleConnsPerHost)
 }
 
 // NewCustomHTTPProxyTransport is used only for proxied requests, specifically
@@ -922,91 +926,6 @@ func iamPolicyClaimNameSA() string {
 	return "sa-policy"
 }
 
-// timedValue contains a synchronized value that is considered valid
-// for a specific amount of time.
-// An Update function must be set to provide an updated value when needed.
-type timedValue struct {
-	// Update must return an updated value.
-	// If an error is returned the cached value is not set.
-	// Only one caller will call this function at any time, others will be blocking.
-	// The returned value can no longer be modified once returned.
-	// Should be set before calling Get().
-	Update func() (interface{}, error)
-
-	// TTL for a cached value.
-	// If not set 1 second TTL is assumed.
-	// Should be set before calling Get().
-	TTL time.Duration
-
-	// When set to true, return the last cached value
-	// even if updating the value errors out
-	Relax bool
-
-	// Once can be used to initialize values for lazy initialization.
-	// Should be set before calling Get().
-	Once sync.Once
-
-	// Managed values.
-	value      interface{}
-	lastUpdate time.Time
-	mu         sync.RWMutex
-}
-
-// Get will return a cached value or fetch a new one.
-// If the Update function returns an error the value is forwarded as is and not cached.
-func (t *timedValue) Get() (interface{}, error) {
-	v := t.get(t.ttl())
-	if v != nil {
-		return v, nil
-	}
-
-	v, err := t.Update()
-	if err != nil {
-		if t.Relax {
-			// if update fails, return current
-			// cached value along with error.
-			//
-			// Let the caller decide if they want
-			// to use the returned value based
-			// on error.
-			v = t.get(0)
-			return v, err
-		}
-		return v, err
-	}
-
-	t.update(v)
-	return v, nil
-}
-
-func (t *timedValue) ttl() time.Duration {
-	ttl := t.TTL
-	if ttl <= 0 {
-		ttl = time.Second
-	}
-	return ttl
-}
-
-func (t *timedValue) get(ttl time.Duration) (v interface{}) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	v = t.value
-	if ttl <= 0 {
-		return v
-	}
-	if time.Since(t.lastUpdate) < ttl {
-		return v
-	}
-	return nil
-}
-
-func (t *timedValue) update(v interface{}) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.value = v
-	t.lastUpdate = time.Now()
-}
-
 // On MinIO a directory object is stored as a regular object with "__XLDIR__" suffix.
 // For ex. "prefix/" is stored as "prefix__XLDIR__"
 func encodeDirObject(object string) string {
@@ -1032,9 +951,8 @@ func isDirObject(object string) bool {
 }
 
 // Helper method to return total number of nodes in cluster
-func totalNodeCount() uint64 {
-	peers, _ := globalEndpoints.peers()
-	totalNodesCount := uint64(len(peers))
+func totalNodeCount() int {
+	totalNodesCount := len(globalEndpoints.Hostnames())
 	if totalNodesCount == 0 {
 		totalNodesCount = 1 // For standalone erasure coding
 	}
@@ -1066,18 +984,19 @@ func auditLogInternal(ctx context.Context, opts AuditLogOptions) {
 	entry.API.Bucket = opts.Bucket
 	entry.API.Objects = []pkgAudit.ObjectVersion{{ObjectName: opts.Object, VersionID: opts.VersionID}}
 	entry.API.Status = opts.Status
-	entry.Tags = opts.Tags
+	if len(opts.Tags) > 0 {
+		entry.Tags = make(map[string]interface{}, len(opts.Tags))
+		for k, v := range opts.Tags {
+			entry.Tags[k] = v
+		}
+	} else {
+		entry.Tags = make(map[string]interface{})
+	}
+
 	// Merge tag information if found - this is currently needed for tags
 	// set during decommissioning.
 	if reqInfo := logger.GetReqInfo(ctx); reqInfo != nil {
-		if tags := reqInfo.GetTagsMap(); len(tags) > 0 {
-			if entry.Tags == nil {
-				entry.Tags = make(map[string]interface{}, len(tags))
-			}
-			for k, v := range tags {
-				entry.Tags[k] = v
-			}
-		}
+		reqInfo.PopulateTagsMap(entry.Tags)
 	}
 	ctx = logger.SetAuditEntry(ctx, &entry)
 	logger.AuditLog(ctx, nil, nil, nil)
@@ -1264,4 +1183,22 @@ func unwrapAll(err error) error {
 func stringsHasPrefixFold(s, prefix string) bool {
 	// Test match with case first.
 	return len(s) >= len(prefix) && (s[0:len(prefix)] == prefix || strings.EqualFold(s[0:len(prefix)], prefix))
+}
+
+func ptr[T any](a T) *T {
+	return &a
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
